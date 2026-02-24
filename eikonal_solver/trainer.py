@@ -52,10 +52,14 @@ from dataset import build_dataloaders
 # ---------------------------------------------------------------------------
 
 class SpearmanEvalCallback(pl.Callback):
-    """Periodically evaluate Spearman on a held-out image, log to TensorBoard."""
+    """Periodically evaluate Spearman on a held-out image, log to TensorBoard.
+
+    Computes both model-predicted and Euclidean-baseline Spearman coefficients.
+    When a new best mean Spearman is achieved, saves a path-visualization PNG.
+    """
 
     def __init__(self, image_path: str, eval_every_n_epochs: int = 10,
-                 k: int = 19, min_in_patch: int = 3, downsample: int = 1024):
+                 k: int = 10, min_in_patch: int = 3, downsample: int = 1024):
         super().__init__()
         self.image_path = image_path
         self.eval_every = eval_every_n_epochs
@@ -67,6 +71,7 @@ class SpearmanEvalCallback(pl.Callback):
         self._info = None
         self._scale = 1.0
         self._rp_cache: dict = {}
+        self._best_spearman = float("-inf")  # track best for visualization trigger
 
     def on_train_epoch_end(self, trainer: "pl.Trainer", pl_module) -> None:
         epoch = trainer.current_epoch + 1
@@ -75,15 +80,21 @@ class SpearmanEvalCallback(pl.Callback):
         if not os.path.isfile(self.image_path):
             return
         try:
-            metrics = self._evaluate(pl_module)
+            # Infer visualization output directory from trainer
+            vis_dir = os.path.join(trainer.default_root_dir, "eval_vis")
+            metrics = self._evaluate(pl_module, epoch, vis_dir)
             for key, val in metrics.items():
                 pl_module.log(key, val, prog_bar=(key == "eval_spearman"),
                               on_epoch=True, sync_dist=False)
-            print(f"\n[SpearmanEval ep={epoch}] "
-                  f"Spearman={metrics['eval_spearman']:+.4f}  "
-                  f"Kendall={metrics['eval_kendall']:+.4f}  "
-                  f"PW={metrics['eval_pw_acc']:.4f}  "
-                  f"n_anchors={metrics['eval_n_anchors']:.0f}")
+            print(
+                f"\n[SpearmanEval ep={epoch}] "
+                f"Model Spearman={metrics['eval_spearman']:+.4f}  "
+                f"Euc Spearman={metrics['eval_spearman_euc']:+.4f}  "
+                f"Kendall={metrics['eval_kendall']:+.4f}  "
+                f"PW={metrics['eval_pw_acc']:.4f}  "
+                f"n_anchors={metrics['eval_n_anchors']:.0f}"
+                + ("  ★ NEW BEST — visualization saved" if metrics.get("_new_best") else "")
+            )
         except Exception as exc:
             import traceback
             print(f"\n[SpearmanEval ep={epoch}] error: {exc}")
@@ -120,7 +131,7 @@ class SpearmanEvalCallback(pl.Callback):
         self._info = info
 
     @torch.no_grad()
-    def _evaluate(self, model) -> dict:
+    def _evaluate(self, model, epoch: int, vis_dir: str) -> dict:
         import math
         import numpy as np
         import torch.nn.functional as F
@@ -144,7 +155,11 @@ class SpearmanEvalCallback(pl.Callback):
         _, _, H_ds, W_ds = self._rgb_ds.shape
         N = nodes_yx.shape[0]
 
-        sp_acc, kd_acc, pw_acc = [], [], []
+        sp_acc, kd_acc, pw_acc, sp_euc_acc = [], [], [], []
+        # Track the anchor with the highest single-anchor model Spearman for visualization
+        best_anchor_sp = float("-inf")
+        best_vis_data = None
+
         for anc_idx in range(N):
             _, nn_global = pick_anchor_and_knn(nodes_yx, k=self.k, anchor_idx=anc_idx)
             anc = nodes_yx[anc_idx]
@@ -162,6 +177,7 @@ class SpearmanEvalCallback(pl.Callback):
             tgt_patch = tgts_g[keep] - torch.tensor([py0, px0], device=device)
             anc_patch = torch.tensor([ay - py0, ax - px0], device=device).long()
 
+            # Cache road-prob per patch (patch boundaries as key)
             key = (py0, py1, px0, px1)
             if key not in self._rp_cache:
                 rgb_p = self._rgb_ds[:, :, py0:py1, px0:px1]
@@ -172,6 +188,7 @@ class SpearmanEvalCallback(pl.Callback):
                 self._rp_cache[key] = ms[0, :, :, 1].detach()
             rp = self._rp_cache[key]
 
+            # Eikonal distance for each target (small per-pair ROI)
             T_vals = []
             H_r, W_r = rp.shape
             for ki in range(tgt_patch.shape[0]):
@@ -217,19 +234,219 @@ class SpearmanEvalCallback(pl.Callback):
             T_norm = T_raw * pscale / max(meta_px, 1)
             nn_np = nn_kept.cpu().numpy().astype(int)
             gt_arr = np.asarray(info["undirected_dist_norm"][case][anc_idx, nn_np], dtype=np.float64)
+            euc_arr = np.asarray(info["euclidean_dist_norm"][case][anc_idx, nn_np], dtype=np.float64)
+
             valid = np.isfinite(T_norm) & (T_norm < 1e3) & np.isfinite(gt_arr)
             if valid.sum() < 3:
                 continue
+
             pv, gv = T_norm[valid], gt_arr[valid]
-            sp_acc.append(spearmanr(pv, gv))
+            anc_sp = spearmanr(pv, gv)
+            sp_acc.append(anc_sp)
             kd_acc.append(kendall_tau(pv, gv))
             pw_acc.append(pairwise_order_acc(pv, gv))
 
+            # Euclidean baseline Spearman
+            valid_euc = valid & np.isfinite(euc_arr)
+            if valid_euc.sum() >= 3:
+                sp_euc_acc.append(spearmanr(euc_arr[valid_euc], gt_arr[valid_euc]))
+
+            # Track best anchor for visualization
+            if anc_sp > best_anchor_sp:
+                best_anchor_sp = anc_sp
+                best_vis_data = {
+                    "anc_idx": anc_idx,
+                    "anc_patch": anc_patch.clone(),
+                    "tgt_patch": tgt_patch.clone(),
+                    "nn_np": nn_np.copy(),
+                    "rp_key": key,
+                    "py0": py0, "px0": px0,
+                }
+
         if not sp_acc:
-            return dict(eval_spearman=float("nan"), eval_kendall=float("nan"),
-                        eval_pw_acc=float("nan"), eval_n_anchors=0.0)
-        return dict(eval_spearman=float(np.mean(sp_acc)), eval_kendall=float(np.mean(kd_acc)),
-                    eval_pw_acc=float(np.nanmean(pw_acc)), eval_n_anchors=float(len(sp_acc)))
+            return dict(eval_spearman=float("nan"), eval_spearman_euc=float("nan"),
+                        eval_kendall=float("nan"), eval_pw_acc=float("nan"),
+                        eval_n_anchors=0.0)
+
+        mean_sp = float(np.mean(sp_acc))
+        result = dict(
+            eval_spearman=mean_sp,
+            eval_spearman_euc=float(np.mean(sp_euc_acc)) if sp_euc_acc else float("nan"),
+            eval_kendall=float(np.mean(kd_acc)),
+            eval_pw_acc=float(np.nanmean(pw_acc)),
+            eval_n_anchors=float(len(sp_acc)),
+        )
+
+        # Visualize paths when a new best mean Spearman is achieved
+        new_best = mean_sp > self._best_spearman
+        if new_best and best_vis_data is not None:
+            self._best_spearman = mean_sp
+            result["_new_best"] = True
+            try:
+                self._visualize_best_anchor(model, best_vis_data, epoch,
+                                            mean_sp, vis_dir, device, margin)
+            except Exception as ve:
+                print(f"\n[SpearmanEval] visualization error: {ve}")
+        return result
+
+    @torch.no_grad()
+    def _visualize_best_anchor(self, model, vis_data: dict, epoch: int,
+                               mean_sp: float, vis_dir: str,
+                               device: torch.device, margin: int) -> None:
+        """Run full-ROI Eikonal on the best anchor and save a path visualization."""
+        import numpy as np
+        import torch.nn.functional as F
+        from eikonal import EikonalConfig, eikonal_soft_sweeping
+        from evaluator import trace_path_from_T, calc_path_len
+
+        rp = self._rp_cache[vis_data["rp_key"]]
+        anc = vis_data["anc_patch"]
+        tgts = vis_data["tgt_patch"]
+        py0, px0 = vis_data["py0"], vis_data["px0"]
+        nn_np = vis_data["nn_np"]
+        K = tgts.shape[0]
+        H_r, W_r = rp.shape
+
+        # Single large ROI covering all targets for a clean T-field
+        if K > 0:
+            span_max = int(torch.max(torch.abs(tgts.float() - anc.float())).item())
+        else:
+            span_max = 0
+        half = span_max + margin
+        P = max(2 * half + 1, 256)
+        y0 = int(anc[0]) - half; x0 = int(anc[1]) - half
+        y1 = y0 + P; x1 = x0 + P
+        yy0, xx0 = max(y0, 0), max(x0, 0)
+        yy1, xx1 = min(y1, H_r), min(x1, W_r)
+
+        patch = torch.zeros(P, P, device=device, dtype=rp.dtype)
+        patch[yy0-y0:yy1-y0, xx0-x0:xx1-x0] = rp[yy0:yy1, xx0:xx1]
+
+        cost = model._road_prob_to_cost(patch)
+        sr_y = max(0, min(int(anc[0]) - y0, P - 1))
+        sr_x = max(0, min(int(anc[1]) - x0, P - 1))
+        smask = torch.zeros(1, P, P, dtype=torch.bool, device=device)
+        smask[0, sr_y, sr_x] = True
+        # Use more iterations for a high-quality visualization T-field
+        cfg = EikonalConfig(n_iters=max(500, P), h=1.0, tau_min=0.03,
+                            tau_branch=0.05, tau_update=0.03,
+                            use_redblack=True, monotone=True)
+        T_patch = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)
+        if T_patch.dim() == 3:
+            T_patch = T_patch[0]
+
+        # Backtrace paths
+        src_rel = torch.tensor([sr_y, sr_x], device=device, dtype=torch.long)
+        paths_global, t_vals = [], []
+        for ki in range(K):
+            tr_y = max(0, min(int(tgts[ki, 0]) - y0, P - 1))
+            tr_x = max(0, min(int(tgts[ki, 1]) - x0, P - 1))
+            tval = float(T_patch[tr_y, tr_x].item())
+            t_vals.append(tval)
+            tgt_rel = torch.tensor([tr_y, tr_x], device=device, dtype=torch.long)
+            pp = trace_path_from_T(T_patch, src_rel, tgt_rel, device, diag=True)
+            if len(pp) >= 2:
+                paths_global.append([(p[0] + y0, p[1] + x0) for p in pp])
+            else:
+                paths_global.append(None)
+
+        # Build global coordinate tensors for the plotter
+        anc_global = torch.tensor([int(anc[0]) + py0, int(anc[1]) + px0],
+                                  device=device, dtype=torch.long)
+        tgts_global = tgts + torch.tensor([py0, px0], device=device)
+
+        os.makedirs(vis_dir, exist_ok=True)
+        save_path = os.path.join(vis_dir, f"ep{epoch:03d}_sp{mean_sp:+.4f}.png")
+
+        # Use evaluator's plotting helper
+        from evaluator import SAMRouteEvaluator
+        # Create a lightweight evaluator-like plot call without loading the model
+        _plot_paths_standalone(
+            rgb=self._rgb_ds,
+            road_prob=rp,
+            src=anc_global,
+            tgts=tgts_global,
+            T_patch=T_patch,
+            y0=y0, x0=x0, P=P,
+            paths_global=paths_global,
+            t_vals=t_vals,
+            nn_np=nn_np,
+            save_path=save_path,
+        )
+        print(f"  [vis] {save_path}")
+
+
+def _plot_paths_standalone(rgb, road_prob, src, tgts, T_patch,
+                           y0, x0, P, paths_global, t_vals, nn_np, save_path):
+    """Standalone path visualization (no model required)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patheffects as pe
+    import numpy as np
+    import torch.nn.functional as F
+
+    if rgb.dim() == 4:
+        rgb = rgb[0]
+    img_np = (rgb.detach().float().cpu().permute(1, 2, 0).numpy() * 255).astype("uint8")
+    H_img, W_img = img_np.shape[:2]
+    H, W = road_prob.shape
+    scale_img = H_img / max(H, 1)
+    road_np = road_prob.detach().float().cpu().numpy()
+    T_np = T_patch.detach().float().cpu().numpy()
+    K = tgts.shape[0]
+    y1, x1 = y0 + P, x0 + P
+
+    T_full = np.full((H_img, W_img), np.nan, dtype=np.float32)
+    iy0, ix0 = max(0, int(y0 * scale_img)), max(0, int(x0 * scale_img))
+    iy1 = min(H_img, int(np.ceil(y1 * scale_img)))
+    ix1 = min(W_img, int(np.ceil(x1 * scale_img)))
+    rh, rw = iy1 - iy0, ix1 - ix0
+    if rh > 0 and rw > 0:
+        T_full[iy0:iy1, ix0:ix1] = F.interpolate(
+            torch.from_numpy(T_np)[None, None], size=(rh, rw),
+            mode="bilinear", align_corners=False).squeeze().numpy()
+
+    finite = np.isfinite(T_full)
+    vmin = float(np.min(T_full[finite])) if finite.any() else 0.0
+    vmax = float(np.percentile(T_full[finite], 99)) if finite.any() else 1.0
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(K, 1)))
+    fig, ax = plt.subplots(figsize=(14, 14))
+    ax.imshow(img_np)
+    masked_road = np.ma.masked_where(road_np < 0.1, road_np)
+    ax.imshow(masked_road, cmap="Reds", vmin=0, vmax=1, alpha=0.4)
+    ax.imshow(T_full, cmap="magma", vmin=vmin, vmax=vmax, alpha=0.32)
+    ax.plot([ix0, ix1, ix1, ix0, ix0], [iy0, iy0, iy1, iy1, iy0],
+            color="white", lw=1.5, ls="--", alpha=0.75, zorder=8)
+
+    for ki, path in enumerate(paths_global):
+        if path is not None:
+            ys = [p[0] * scale_img for p in path]
+            xs = [p[1] * scale_img for p in path]
+            ax.plot(xs, ys, color=colors[ki], lw=2.0, alpha=0.85, zorder=10,
+                    path_effects=[pe.Stroke(linewidth=3.5, foreground="black", alpha=0.5),
+                                  pe.Normal()])
+
+    for ki in range(K):
+        ty = int(tgts[ki, 0].item() * scale_img)
+        tx = int(tgts[ki, 1].item() * scale_img)
+        tval = t_vals[ki]
+        lbl = f"node {nn_np[ki]}  T={tval:.0f}" if np.isfinite(tval) else f"node {nn_np[ki]}"
+        ax.scatter([tx], [ty], s=220, marker="x", color=colors[ki],
+                   linewidths=2.5, zorder=14, label=lbl)
+
+    sy = int(src[0].item() * scale_img)
+    sx_img = int(src[1].item() * scale_img)
+    ax.scatter([sx_img], [sy], s=300, marker="o", color="lime",
+               edgecolors="black", linewidths=2.5, zorder=15, label="Source")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=8.5, framealpha=0.9)
+    ax.axis("off")
+    ax.set_title("SAMRoute: shortest paths (magma=T-field, red=road_prob)", fontsize=11)
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +500,7 @@ def parse_args():
     p.add_argument("--road_dilation_radius", type=int, default=0)
     p.add_argument("--eval_every_n_epochs", type=int, default=0)
     p.add_argument("--eval_image_path", type=str, default="")
-    p.add_argument("--eval_k", type=int, default=19)
+    p.add_argument("--eval_k", type=int, default=10)
     p.add_argument("--eval_min_in_patch", type=int, default=3)
     return p.parse_args()
 

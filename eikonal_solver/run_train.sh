@@ -32,7 +32,7 @@ ROAD_DILATION_RADIUS=5
 # Spearman eval (phase 1 only, 0 = disabled)
 EVAL_EVERY_N_EPOCHS=0
 EVAL_IMAGE_PATH="Gen_dataset_V2/Gen_dataset/34.269888_108.947180/01_34.350697_108.914569_3000.0/crop_34.350697_108.914569_3000.0_z16.tif"
-EVAL_K=19
+EVAL_K=10
 EVAL_MIN_IN_PATCH=3
 
 # ---- parse arguments ----
