@@ -409,7 +409,7 @@ class SAMRouteEvaluator:
                 P_pad = math.ceil(P / ds) * ds
                 if P_pad > P:
                     roi = F.pad(roi, (0, P_pad - P, 0, P_pad - P), value=0.0)
-                roi_c = F.avg_pool2d(roi[None, None], kernel_size=ds, stride=ds).squeeze()
+                roi_c = F.max_pool2d(roi[None, None], kernel_size=ds, stride=ds).squeeze()
                 cost = self.model._road_prob_to_cost(roi_c)
                 Pc = cost.shape[0]
                 sc_y = max(0, min(sr_y // ds, Pc - 1))

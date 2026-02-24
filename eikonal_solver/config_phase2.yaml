@@ -31,7 +31,8 @@ USE_SAM_DECODER: False
 
 # ---- Loss weights ----
 ROUTE_LAMBDA_SEG: 1.0
-ROUTE_LAMBDA_DIST: 0.01      # normalised dist_loss ~30, so 0.01*30 ≈ 0.3 ≈ seg_loss
+ROUTE_LAMBDA_DIST: 0.1       # dist_loss converges to ~0.1-1.0 after normalisation by 512;
+                              # 0.1*0.5 = 0.05 keeps distance supervision meaningful (~20-50% of seg_loss)
 
 # LR schedule: decay at epoch 80
 LR_MILESTONES: [80]

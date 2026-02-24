@@ -1043,7 +1043,7 @@ class SAMRoute(SAMRoad):
         # This gives the model wide-road recall (BCE) + sharp boundaries (Dice).
         self._road_dual_target  = bool(_cfg(config, "ROAD_DUAL_TARGET", False))
         self.road_criterion = torch.nn.BCEWithLogitsLoss()  # pos_weight applied dynamically in _seg_forward
-        self.dist_criterion = torch.nn.HuberLoss(delta=50.0)
+        self.dist_criterion = torch.nn.HuberLoss(delta=2.0)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1196,7 +1196,7 @@ class SAMRoute(SAMRoad):
                 if P_pad > P:
                     patch = F.pad(patch, (0, P_pad - P, 0, P_pad - P), value=0.0)
 
-                patch_coarse = F.avg_pool2d(
+                patch_coarse = F.max_pool2d(
                     patch.unsqueeze(0).unsqueeze(0), kernel_size=ds, stride=ds
                 ).squeeze(0).squeeze(0)  # [P_c, P_c]
 
@@ -1448,9 +1448,11 @@ class SAMRoute(SAMRoad):
                                        device=gt_dist.device)
 
             lam  = self._effective_lambda_dist()
-            loss = loss + lam * loss_dist
+            dist_contrib = lam * loss_dist
+            loss = loss + dist_contrib
 
             self.log("train_dist_loss", loss_dist, on_step=True, on_epoch=False, prog_bar=True)
+            self.log("dist_loss_weighted", dist_contrib, on_step=True, on_epoch=False, prog_bar=True)
             self.log("lambda_dist_eff", lam,       on_step=True, on_epoch=False)
             self.log("eik_iters_eff", float(eik_cfg.n_iters), on_step=True, on_epoch=False)
 
@@ -1679,7 +1681,7 @@ class SAMRoute(SAMRoad):
             if P_pad > P:
                 patch = F.pad(patch, (0, P_pad - P, 0, P_pad - P), value=0.0)
 
-            patch_c = F.avg_pool2d(
+            patch_c = F.max_pool2d(
                 patch.unsqueeze(0).unsqueeze(0), kernel_size=ds_common, stride=ds_common
             ).squeeze(0).squeeze(0)  # [ceil(P/ds), ceil(P/ds)]
 

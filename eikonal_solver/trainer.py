@@ -317,7 +317,7 @@ class SpearmanEvalCallback(pl.Callback):
             patch_ds = patch_full
             if P_pad > P:
                 patch_ds = F.pad(patch_full, (0, P_pad - P, 0, P_pad - P), value=0.0)
-            roi_c = F.avg_pool2d(patch_ds[None, None], kernel_size=ds, stride=ds).squeeze()
+            roi_c = F.max_pool2d(patch_ds[None, None], kernel_size=ds, stride=ds).squeeze()
             cost_c = model._road_prob_to_cost(roi_c)
             Pc = cost_c.shape[0]
             sc_y = max(0, min(sr_y // ds, Pc - 1))
@@ -566,7 +566,7 @@ def _eikonal_one_src_k_tgts(
         P_pad = math.ceil(P / ds) * ds
         if P_pad > P:
             roi = F.pad(roi, (0, P_pad - P, 0, P_pad - P), value=0.0)
-        roi_c = F.avg_pool2d(roi[None, None], kernel_size=ds, stride=ds).squeeze()
+        roi_c = F.max_pool2d(roi[None, None], kernel_size=ds, stride=ds).squeeze()
         cost = model._road_prob_to_cost(roi_c)
         Pc = cost.shape[0]
         sc_y = max(0, min(sr_y // ds, Pc - 1))
