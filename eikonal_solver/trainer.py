@@ -14,6 +14,7 @@ ROUTE_LAMBDA_DIST > 0 and --include_dist is passed.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import argparse
@@ -71,6 +72,7 @@ class SpearmanEvalCallback(pl.Callback):
         self._info = None
         self._scale = 1.0
         self._rp_cache: dict = {}
+        self._gt_mask_ds = None
         self._best_spearman = float("-inf")  # track best for visualization trigger
 
     def on_train_epoch_end(self, trainer: "pl.Trainer", pl_module) -> None:
@@ -106,7 +108,9 @@ class SpearmanEvalCallback(pl.Callback):
             return
         from evaluator import load_tif_image
         from dataset import load_nodes_from_npz
+        import glob as _glob
         import torch.nn.functional as F
+        from PIL import Image as _PILImage
 
         rgb = load_tif_image(self.image_path).to(device)
         _, _, H, W = rgb.shape
@@ -117,6 +121,25 @@ class SpearmanEvalCallback(pl.Callback):
                                 mode="bilinear", align_corners=False)
         self._rgb_ds = rgb
         self._scale = scale
+
+        # Load GT road mask from the same region directory as the TIF.
+        # Prefer the original thin roadnet PNG (most truthful GT).
+        region_dir = os.path.dirname(self.image_path)
+        gt_pngs = sorted(_glob.glob(os.path.join(region_dir, "roadnet_*.png")))
+        gt_pngs = [p for p in gt_pngs if "normalized" not in os.path.basename(p)]
+        if gt_pngs:
+            import numpy as _np
+            _arr = _np.array(_PILImage.open(gt_pngs[0]))
+            _mask = _arr[:, :, 0].astype(_np.float32) / 255.0  # [H, W] float32
+            gt_t = torch.from_numpy(_mask).unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
+            if scale != 1.0:
+                _, _, H_ds, W_ds = rgb.shape
+                gt_t = F.interpolate(gt_t, size=(H_ds, W_ds), mode="bilinear",
+                                     align_corners=False)
+            self._gt_mask_ds = gt_t.squeeze()  # [H_ds, W_ds]
+        else:
+            self._gt_mask_ds = None
+
         rp_dummy = torch.zeros(H, W, device=device)
         nodes_orig, info = load_nodes_from_npz(
             self.image_path, rp_dummy, p_count=20, snap=False, verbose=False)
@@ -242,7 +265,8 @@ class SpearmanEvalCallback(pl.Callback):
             result["_new_best"] = True
             try:
                 self._visualize_best_anchor(model, best_vis_data, epoch,
-                                            mean_sp, vis_dir, device, margin)
+                                            mean_sp, vis_dir, device, margin,
+                                            n_iters, min_ds, self._gt_mask_ds)
             except Exception as ve:
                 print(f"\n[SpearmanEval] visualization error: {ve}")
         return result
@@ -250,8 +274,10 @@ class SpearmanEvalCallback(pl.Callback):
     @torch.no_grad()
     def _visualize_best_anchor(self, model, vis_data: dict, epoch: int,
                                mean_sp: float, vis_dir: str,
-                               device: torch.device, margin: int) -> None:
-        """Run full-ROI Eikonal on the best anchor and save a path visualization."""
+                               device: torch.device, margin: int,
+                               n_iters: int = 20, min_ds: int = 8,
+                               gt_mask=None) -> None:
+        """Run same-params Eikonal as evaluation on the best anchor, save visualization."""
         import numpy as np
         import torch.nn.functional as F
         from eikonal import EikonalConfig, eikonal_soft_sweeping
@@ -277,21 +303,48 @@ class SpearmanEvalCallback(pl.Callback):
         yy0, xx0 = max(y0, 0), max(x0, 0)
         yy1, xx1 = min(y1, H_r), min(x1, W_r)
 
-        patch = torch.zeros(P, P, device=device, dtype=rp.dtype)
-        patch[yy0-y0:yy1-y0, xx0-x0:xx1-x0] = rp[yy0:yy1, xx0:xx1]
+        patch_full = torch.zeros(P, P, device=device, dtype=rp.dtype)
+        patch_full[yy0-y0:yy1-y0, xx0-x0:xx1-x0] = rp[yy0:yy1, xx0:xx1]
 
-        cost = model._road_prob_to_cost(patch)
         sr_y = max(0, min(int(anc[0]) - y0, P - 1))
         sr_x = max(0, min(int(anc[1]) - x0, P - 1))
-        smask = torch.zeros(1, P, P, dtype=torch.bool, device=device)
-        smask[0, sr_y, sr_x] = True
-        # Use more iterations for a high-quality visualization T-field
-        cfg = EikonalConfig(n_iters=max(500, P), h=1.0, tau_min=0.03,
-                            tau_branch=0.05, tau_update=0.03,
-                            use_redblack=True, monotone=True)
-        T_patch = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)
-        if T_patch.dim() == 3:
-            T_patch = T_patch[0]
+
+        # Use the SAME downsample params as the Spearman evaluation so that
+        # T values and paths in the visualization match actual model behavior.
+        ds = max(min_ds, int(math.ceil(P / max(n_iters, 1))))
+        if ds > 1:
+            P_pad = int(math.ceil(P / ds) * ds)
+            patch_ds = patch_full
+            if P_pad > P:
+                patch_ds = F.pad(patch_full, (0, P_pad - P, 0, P_pad - P), value=0.0)
+            roi_c = F.avg_pool2d(patch_ds[None, None], kernel_size=ds, stride=ds).squeeze()
+            cost_c = model._road_prob_to_cost(roi_c)
+            Pc = cost_c.shape[0]
+            sc_y = max(0, min(sr_y // ds, Pc - 1))
+            sc_x = max(0, min(sr_x // ds, Pc - 1))
+            smask = torch.zeros(1, Pc, Pc, dtype=torch.bool, device=device)
+            smask[0, sc_y, sc_x] = True
+            cfg = EikonalConfig(n_iters=n_iters, h=float(ds), tau_min=0.03,
+                                tau_branch=0.05, tau_update=0.03,
+                                use_redblack=True, monotone=True)
+            T_coarse = eikonal_soft_sweeping(cost_c.unsqueeze(0), smask, cfg)
+            if T_coarse.dim() == 3:
+                T_coarse = T_coarse[0]
+            # Upsample back to P×P so path-tracing coordinates align with the patch
+            T_patch = F.interpolate(
+                T_coarse[None, None], size=(P, P),
+                mode="bilinear", align_corners=False).squeeze()
+            # Preserve the h-scaling: T_coarse is in units of ds pixels, keep as-is
+        else:
+            cost_c = model._road_prob_to_cost(patch_full)
+            smask = torch.zeros(1, P, P, dtype=torch.bool, device=device)
+            smask[0, sr_y, sr_x] = True
+            cfg = EikonalConfig(n_iters=n_iters, h=1.0, tau_min=0.03,
+                                tau_branch=0.05, tau_update=0.03,
+                                use_redblack=True, monotone=True)
+            T_patch = eikonal_soft_sweeping(cost_c.unsqueeze(0), smask, cfg)
+            if T_patch.dim() == 3:
+                T_patch = T_patch[0]
 
         # Backtrace paths
         # y0/x0 are offsets in PATCH space; adding py0/px0 converts to full-image space.
@@ -329,6 +382,7 @@ class SpearmanEvalCallback(pl.Callback):
         _plot_paths_standalone(
             rgb=self._rgb_ds,
             road_prob=road_prob_full,
+            gt_mask=gt_mask,
             src=anc_global,
             tgts=tgts_global,
             T_patch=T_patch,
@@ -345,83 +399,115 @@ class SpearmanEvalCallback(pl.Callback):
 def _plot_paths_standalone(rgb, road_prob, src, tgts, T_patch,
                            t_y0, t_x0, P,
                            patch_y0, patch_x0, patch_h, patch_w,
-                           paths_global, t_vals, nn_np, save_path):
-    """Standalone path visualization (no model required).
+                           paths_global, t_vals, nn_np, save_path,
+                           gt_mask=None):
+    """Two-panel path visualization: GT road (left) vs Predicted road + T-field + paths (right).
 
-    Coordinate convention (all in full-downsampled-image pixel space, scale_img=1):
-      t_y0/t_x0/P  – top-left + size of the Eikonal T-field ROI (for T overlay).
-      patch_y0/patch_x0/patch_h/patch_w – extent of road_prob PATCH (for white box).
+    Coordinate convention (all in full-downsampled-image pixel space):
+      t_y0/t_x0/P  – top-left + size of the Eikonal T-field ROI.
+      patch_y0/patch_x0/patch_h/patch_w – extent of road_prob PATCH (white box).
       paths_global – list of [(y,x), ...] in full-image pixel space.
       src, tgts    – (y,x) tensors in full-image pixel space.
+      gt_mask      – optional [H_img, W_img] tensor with GT road probability in [0,1].
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.patheffects as pe
     import numpy as np
-    import torch.nn.functional as F
 
     if rgb.dim() == 4:
         rgb = rgb[0]
     img_np = (rgb.detach().float().cpu().permute(1, 2, 0).numpy() * 255).astype("uint8")
     H_img, W_img = img_np.shape[:2]
-    # road_prob is full-size (H_img × W_img), so scale_img == 1.0 always.
     road_np = road_prob.detach().float().cpu().numpy()
     T_np = T_patch.detach().float().cpu().numpy()
     K = tgts.shape[0]
 
-    # Place T-field in a full-size canvas (NaN outside the ROI).
+    # ── T-field: clip to PATCH, log-normalize ──────────────────────────────
     t_y1, t_x1 = t_y0 + P, t_x0 + P
-    iy0 = max(0, t_y0);  ix0 = max(0, t_x0)
-    iy1 = min(H_img, t_y1); ix1 = min(W_img, t_x1)
-    rh, rw = iy1 - iy0, ix1 - ix0
+    iy0 = max(0, t_y0, patch_y0)
+    ix0 = max(0, t_x0, patch_x0)
+    iy1 = min(H_img, t_y1, patch_y0 + patch_h)
+    ix1 = min(W_img, t_x1, patch_x0 + patch_w)
     T_full = np.full((H_img, W_img), np.nan, dtype=np.float32)
-    if rh > 0 and rw > 0:
-        T_full[iy0:iy1, ix0:ix1] = F.interpolate(
-            torch.from_numpy(T_np)[None, None], size=(rh, rw),
-            mode="bilinear", align_corners=False).squeeze().numpy()
+    if iy1 > iy0 and ix1 > ix0:
+        sy0, sx0 = iy0 - t_y0, ix0 - t_x0
+        T_full[iy0:iy1, ix0:ix1] = T_np[sy0:sy0 + (iy1 - iy0), sx0:sx0 + (ix1 - ix0)]
 
     finite = np.isfinite(T_full)
-    vmin = float(np.min(T_full[finite])) if finite.any() else 0.0
-    vmax = float(np.percentile(T_full[finite], 99)) if finite.any() else 1.0
+    if finite.any():
+        raw_min = float(np.min(T_full[finite]))
+        raw_max = float(np.percentile(T_full[finite], 99))
+        T_shifted = np.where(finite, T_full - raw_min, np.nan)
+        T_display = np.log1p(T_shifted)
+        vmin_log, vmax_log = 0.0, float(np.log1p(max(raw_max - raw_min, 1e-3)))
+    else:
+        T_display = T_full
+        vmin_log, vmax_log = 0.0, 1.0
 
-    # White dashed box aligns with the road_prob patch boundary.
-    bx0 = max(0, patch_x0);          by0 = max(0, patch_y0)
+    # ── Patch boundary box ─────────────────────────────────────────────────
+    bx0 = max(0, patch_x0);               by0 = max(0, patch_y0)
     bx1 = min(W_img, patch_x0 + patch_w); by1 = min(H_img, patch_y0 + patch_h)
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(K, 1)))
-    fig, ax = plt.subplots(figsize=(14, 14))
-    ax.imshow(img_np)
+    sy = int(src[0].item());  sx_img = int(src[1].item())
+
+    has_gt = gt_mask is not None
+    n_cols = 2 if has_gt else 1
+    fig_w = 14 * n_cols
+    fig, axes = plt.subplots(1, n_cols, figsize=(fig_w, 14))
+    if n_cols == 1:
+        axes = [axes]
+
+    def _draw_nodes_and_paths(ax, draw_paths=True):
+        ax.plot([bx0, bx1, bx1, bx0, bx0], [by0, by0, by1, by1, by0],
+                color="white", lw=1.5, ls="--", alpha=0.75, zorder=8)
+        if draw_paths:
+            for ki, path in enumerate(paths_global):
+                if path is not None:
+                    ys = [p[0] for p in path]
+                    xs = [p[1] for p in path]
+                    ax.plot(xs, ys, color=colors[ki], lw=2.0, alpha=0.85, zorder=10,
+                            path_effects=[pe.Stroke(linewidth=3.5, foreground="black",
+                                                    alpha=0.5), pe.Normal()])
+        for ki in range(K):
+            ty = int(tgts[ki, 0].item());  tx = int(tgts[ki, 1].item())
+            tval = t_vals[ki]
+            lbl = (f"node {nn_np[ki]}  T={tval:.0f}"
+                   if np.isfinite(tval) else f"node {nn_np[ki]}")
+            ax.scatter([tx], [ty], s=220, marker="x", color=colors[ki],
+                       linewidths=2.5, zorder=14, label=lbl if draw_paths else "_")
+        ax.scatter([sx_img], [sy], s=300, marker="o", color="lime",
+                   edgecolors="black", linewidths=2.5, zorder=15,
+                   label="Source" if draw_paths else "_")
+        ax.axis("off")
+
+    # ── Left panel: GT road ────────────────────────────────────────────────
+    if has_gt:
+        ax_gt = axes[0]
+        gt_np = gt_mask.detach().float().cpu().numpy()
+        ax_gt.imshow(img_np)
+        masked_gt = np.ma.masked_where(gt_np < 0.1, gt_np)
+        ax_gt.imshow(masked_gt, cmap="Greens", vmin=0, vmax=1, alpha=0.65)
+        _draw_nodes_and_paths(ax_gt, draw_paths=False)
+        ax_gt.set_title("GT Road Mask", fontsize=12)
+        ax_pred = axes[1]
+    else:
+        ax_pred = axes[0]
+
+    # ── Right panel (or only panel): Predicted road + T-field + paths ──────
+    ax_pred.imshow(img_np)
     masked_road = np.ma.masked_where(road_np < 0.1, road_np)
-    ax.imshow(masked_road, cmap="Reds", vmin=0, vmax=1, alpha=0.4)
-    ax.imshow(T_full, cmap="magma", vmin=vmin, vmax=vmax, alpha=0.32)
-    # White box = patch boundary (matches red road overlay extent).
-    ax.plot([bx0, bx1, bx1, bx0, bx0], [by0, by0, by1, by1, by0],
-            color="white", lw=1.5, ls="--", alpha=0.75, zorder=8)
+    ax_pred.imshow(masked_road, cmap="Reds", vmin=0, vmax=1, alpha=0.35)
+    T_masked = np.ma.masked_invalid(T_display)
+    ax_pred.imshow(T_masked, cmap="plasma", vmin=vmin_log, vmax=vmax_log, alpha=0.55)
+    _draw_nodes_and_paths(ax_pred, draw_paths=True)
+    ax_pred.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=8.5, framealpha=0.9)
+    ax_pred.set_title("Predicted Road + T-field (log-scale) + Paths", fontsize=12)
 
-    for ki, path in enumerate(paths_global):
-        if path is not None:
-            ys = [p[0] for p in path]
-            xs = [p[1] for p in path]
-            ax.plot(xs, ys, color=colors[ki], lw=2.0, alpha=0.85, zorder=10,
-                    path_effects=[pe.Stroke(linewidth=3.5, foreground="black", alpha=0.5),
-                                  pe.Normal()])
-
-    for ki in range(K):
-        ty = int(tgts[ki, 0].item())
-        tx = int(tgts[ki, 1].item())
-        tval = t_vals[ki]
-        lbl = f"node {nn_np[ki]}  T={tval:.0f}" if np.isfinite(tval) else f"node {nn_np[ki]}"
-        ax.scatter([tx], [ty], s=220, marker="x", color=colors[ki],
-                   linewidths=2.5, zorder=14, label=lbl)
-
-    sy = int(src[0].item())
-    sx_img = int(src[1].item())
-    ax.scatter([sx_img], [sy], s=300, marker="o", color="lime",
-               edgecolors="black", linewidths=2.5, zorder=15, label="Source")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=8.5, framealpha=0.9)
-    ax.axis("off")
-    ax.set_title("SAMRoute: shortest paths (magma=T-field, red=road_prob)", fontsize=11)
+    fig.suptitle("SAMRoute Evaluation  (GT road=green  |  Predicted road=red  |  T-field=plasma log-scale)",
+                 fontsize=11, y=1.01)
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
