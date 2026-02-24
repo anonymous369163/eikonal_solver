@@ -107,7 +107,7 @@ class TopoNet(nn.Module):
         batch_size, n_samples, n_pairs, _ = pairs.shape
         pairs = pairs.view(batch_size, -1, 2)
         
-        batch_indices = torch.arange(batch_size).view(-1, 1).expand(-1, n_samples * n_pairs)
+        batch_indices = torch.arange(batch_size, device=point_features.device).view(-1, 1).expand(-1, n_samples * n_pairs)
         # Use advanced indexing to fetch the corresponding feature vectors
         # [B, N_samples * N_pairs, D]
         src_features = point_features[batch_indices, pairs[:, :, 0]]
@@ -121,7 +121,7 @@ class TopoNet(nn.Module):
         # [B, N_samples * N_pairs, 2D + 2]
         if self.config.TOPONET_VERSION == 'no_tgt_features':
             pair_features = torch.concat([src_features, torch.zeros_like(tgt_features), offset], dim=2)
-        if self.config.TOPONET_VERSION == 'no_offset':
+        elif self.config.TOPONET_VERSION == 'no_offset':
             pair_features = torch.concat([src_features, tgt_features, torch.zeros_like(offset)], dim=2)
         else:
             pair_features = torch.concat([src_features, tgt_features, offset], dim=2)
