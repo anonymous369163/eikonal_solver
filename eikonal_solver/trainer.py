@@ -336,6 +336,7 @@ class SpearmanEvalCallback(pl.Callback):
             T_patch = T_patch[0]
 
         # Backtrace paths
+        # y0/x0 are offsets in PATCH space; adding py0/px0 converts to full-image space.
         src_rel = torch.tensor([sr_y, sr_x], device=device, dtype=torch.long)
         paths_global, t_vals = [], []
         for ki in range(K):
@@ -346,7 +347,7 @@ class SpearmanEvalCallback(pl.Callback):
             tgt_rel = torch.tensor([tr_y, tr_x], device=device, dtype=torch.long)
             pp = trace_path_from_T(T_patch, src_rel, tgt_rel, device, diag=True)
             if len(pp) >= 2:
-                paths_global.append([(p[0] + y0, p[1] + x0) for p in pp])
+                paths_global.append([(p[0] + y0 + py0, p[1] + x0 + px0) for p in pp])
             else:
                 paths_global.append(None)
 
@@ -355,19 +356,25 @@ class SpearmanEvalCallback(pl.Callback):
                                   device=device, dtype=torch.long)
         tgts_global = tgts + torch.tensor([py0, px0], device=device)
 
+        # Build a full-size road_prob (H_ds × W_ds) with the patch placed at its
+        # correct position so that scale_img = H_ds/H_ds = 1.0 inside the plotter
+        # and all coordinate arithmetic stays in the same space.
+        H_ds, W_ds = self._rgb_ds.shape[-2:]
+        road_prob_full = torch.zeros(H_ds, W_ds, device=rp.device, dtype=rp.dtype)
+        py1_clip = min(py0 + H_r, H_ds)
+        px1_clip = min(px0 + W_r, W_ds)
+        road_prob_full[py0:py1_clip, px0:px1_clip] = rp[:py1_clip - py0, :px1_clip - px0]
+
         os.makedirs(vis_dir, exist_ok=True)
         save_path = os.path.join(vis_dir, f"ep{epoch:03d}_sp{mean_sp:+.4f}.png")
 
-        # Use evaluator's plotting helper
-        from evaluator import SAMRouteEvaluator
-        # Create a lightweight evaluator-like plot call without loading the model
         _plot_paths_standalone(
             rgb=self._rgb_ds,
-            road_prob=rp,
+            road_prob=road_prob_full,
             src=anc_global,
             tgts=tgts_global,
             T_patch=T_patch,
-            y0=y0, x0=x0, P=P,
+            y0=y0 + py0, x0=x0 + px0, P=P,
             paths_global=paths_global,
             t_vals=t_vals,
             nn_np=nn_np,
