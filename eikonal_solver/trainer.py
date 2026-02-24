@@ -132,10 +132,8 @@ class SpearmanEvalCallback(pl.Callback):
 
     @torch.no_grad()
     def _evaluate(self, model, epoch: int, vis_dir: str) -> dict:
-        import math
         import numpy as np
         import torch.nn.functional as F
-        from eikonal import EikonalConfig, eikonal_soft_sweeping
         from evaluator import pick_anchor_and_knn, spearmanr, kendall_tau, pairwise_order_acc
 
         device = next(model.parameters()).device
@@ -188,49 +186,9 @@ class SpearmanEvalCallback(pl.Callback):
                 self._rp_cache[key] = ms[0, :, :, 1].detach()
             rp = self._rp_cache[key]
 
-            # Eikonal distance for each target (small per-pair ROI)
-            T_vals = []
-            H_r, W_r = rp.shape
-            for ki in range(tgt_patch.shape[0]):
-                tgt = tgt_patch[ki].long()
-                span = int(torch.max(torch.abs(tgt.float() - anc_patch.float())).item())
-                half = span + margin
-                P = max(2 * half + 1, 64)
-                y0 = int(anc_patch[0]) - half; x0 = int(anc_patch[1]) - half
-                y1 = y0 + P; x1 = x0 + P
-                yy0, xx0 = max(y0, 0), max(x0, 0)
-                yy1, xx1 = min(y1, H_r), min(x1, W_r)
-                roi = F.pad(rp[yy0:yy1, xx0:xx1], (xx0-x0, x1-xx1, yy0-y0, y1-yy1), value=0.0)
-                sr_y = max(0, min(int(anc_patch[0])-y0, P-1))
-                sr_x = max(0, min(int(anc_patch[1])-x0, P-1))
-                tr_y = max(0, min(int(tgt[0])-y0, P-1))
-                tr_x = max(0, min(int(tgt[1])-x0, P-1))
-                ds = max(min_ds, math.ceil(P / max(n_iters, 1)))
-                if ds > 1:
-                    P_pad = math.ceil(P / ds) * ds
-                    if P_pad > P:
-                        roi = F.pad(roi, (0, P_pad-P, 0, P_pad-P), value=0.0)
-                    roi_c = F.avg_pool2d(roi[None, None], kernel_size=ds, stride=ds).squeeze()
-                    cost = model._road_prob_to_cost(roi_c)
-                    Pc = cost.shape[0]
-                    sc_y, sc_x = max(0, min(sr_y//ds, Pc-1)), max(0, min(sr_x//ds, Pc-1))
-                    tc_y, tc_x = max(0, min(tr_y//ds, Pc-1)), max(0, min(tr_x//ds, Pc-1))
-                    smask = torch.zeros(1, Pc, Pc, dtype=torch.bool, device=device)
-                    smask[0, sc_y, sc_x] = True
-                    cfg = EikonalConfig(n_iters=n_iters, h=float(ds), tau_min=0.03,
-                                        tau_branch=0.05, tau_update=0.03, use_redblack=True, monotone=True)
-                    T = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)
-                    T_vals.append(float(T[0, tc_y, tc_x].item()))
-                else:
-                    cost = model._road_prob_to_cost(roi)
-                    smask = torch.zeros(1, P, P, dtype=torch.bool, device=device)
-                    smask[0, sr_y, sr_x] = True
-                    cfg = EikonalConfig(n_iters=n_iters, h=1.0, tau_min=0.03,
-                                        tau_branch=0.05, tau_update=0.03, use_redblack=True, monotone=True)
-                    T = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)
-                    T_vals.append(float(T[0, tr_y, tr_x].item()))
-
-            T_raw = np.array(T_vals, dtype=np.float64)
+            # One Eikonal solve covering all K targets → read K T-values
+            T_raw = _eikonal_one_src_k_tgts(
+                rp, anc_patch, tgt_patch, model, device, margin, n_iters, min_ds)
             T_norm = T_raw * pscale / max(meta_px, 1)
             nn_np = nn_kept.cpu().numpy().astype(int)
             gt_arr = np.asarray(info["undirected_dist_norm"][case][anc_idx, nn_np], dtype=np.float64)
@@ -468,6 +426,91 @@ def _plot_paths_standalone(rgb, road_prob, src, tgts, T_patch,
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Eikonal evaluation helper: one-source → K-targets, single solve
+# ---------------------------------------------------------------------------
+
+def _eikonal_one_src_k_tgts(
+    rp: "torch.Tensor",        # [H_r, W_r] road-prob patch (no grad)
+    anc_patch: "torch.Tensor", # [2] anchor coords in patch space (long)
+    tgt_patch: "torch.Tensor", # [K, 2] target coords in patch space (long)
+    model,
+    device: "torch.device",
+    margin: int,
+    n_iters: int,
+    min_ds: int,
+) -> "np.ndarray":             # [K] float64
+    """One Eikonal solve per anchor covering all K targets; read K T-values.
+
+    Replaces the previous per-target inner loop (K separate small-ROI solves).
+    The coarse grid size is the same as before (~n_iters × n_iters) because
+    ds = max(min_ds, ceil(P / n_iters)) bounds P_c ≈ n_iters regardless of P.
+    Total solves per evaluation: N (anchors) instead of N×K.
+    """
+    import math
+    import numpy as np
+    import torch.nn.functional as F
+    from eikonal import EikonalConfig, eikonal_soft_sweeping
+
+    K = tgt_patch.shape[0]
+    if K == 0:
+        return np.empty(0, dtype=np.float64)
+
+    H_r, W_r = rp.shape
+
+    span_max = int(torch.max(torch.abs(tgt_patch.float() - anc_patch.float())).item())
+    half = span_max + margin
+    P = max(2 * half + 1, 64)
+
+    y0 = int(anc_patch[0]) - half;  x0 = int(anc_patch[1]) - half
+    y1 = y0 + P;                    x1 = x0 + P
+    yy0, xx0 = max(y0, 0), max(x0, 0)
+    yy1, xx1 = min(y1, H_r), min(x1, W_r)
+
+    roi = F.pad(rp[yy0:yy1, xx0:xx1],
+                (xx0 - x0, x1 - xx1, yy0 - y0, y1 - yy1), value=0.0)
+
+    sr_y = max(0, min(int(anc_patch[0]) - y0, P - 1))
+    sr_x = max(0, min(int(anc_patch[1]) - x0, P - 1))
+
+    ds = max(min_ds, math.ceil(P / max(n_iters, 1)))
+    if ds > 1:
+        P_pad = math.ceil(P / ds) * ds
+        if P_pad > P:
+            roi = F.pad(roi, (0, P_pad - P, 0, P_pad - P), value=0.0)
+        roi_c = F.avg_pool2d(roi[None, None], kernel_size=ds, stride=ds).squeeze()
+        cost = model._road_prob_to_cost(roi_c)
+        Pc = cost.shape[0]
+        sc_y = max(0, min(sr_y // ds, Pc - 1))
+        sc_x = max(0, min(sr_x // ds, Pc - 1))
+        smask = torch.zeros(1, Pc, Pc, dtype=torch.bool, device=device)
+        smask[0, sc_y, sc_x] = True
+        cfg = EikonalConfig(n_iters=n_iters, h=float(ds), tau_min=0.03,
+                            tau_branch=0.05, tau_update=0.03,
+                            use_redblack=True, monotone=True)
+        T = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)[0]
+        T_vals = []
+        for ki in range(K):
+            tr_y = max(0, min((int(tgt_patch[ki, 0]) - y0) // ds, Pc - 1))
+            tr_x = max(0, min((int(tgt_patch[ki, 1]) - x0) // ds, Pc - 1))
+            T_vals.append(float(T[tr_y, tr_x].item()))
+    else:
+        cost = model._road_prob_to_cost(roi)
+        smask = torch.zeros(1, P, P, dtype=torch.bool, device=device)
+        smask[0, sr_y, sr_x] = True
+        cfg = EikonalConfig(n_iters=n_iters, h=1.0, tau_min=0.03,
+                            tau_branch=0.05, tau_update=0.03,
+                            use_redblack=True, monotone=True)
+        T = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)[0]
+        T_vals = []
+        for ki in range(K):
+            tr_y = max(0, min(int(tgt_patch[ki, 0]) - y0, P - 1))
+            tr_x = max(0, min(int(tgt_patch[ki, 1]) - x0, P - 1))
+            T_vals.append(float(T[tr_y, tr_x].item()))
+
+    return np.array(T_vals, dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------

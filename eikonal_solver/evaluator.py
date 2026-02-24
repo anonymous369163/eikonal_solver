@@ -386,46 +386,58 @@ class SAMRouteEvaluator:
             return rp_cache[key]
 
         def _eikonal_k(rp, src, tgts):
+            """One Eikonal solve covering all K targets; read K T-values."""
+            K = tgts.shape[0]
+            if K == 0:
+                return np.empty(0, dtype=np.float64)
             H_r, W_r = rp.shape
-            vals = []
-            for ki in range(tgts.shape[0]):
-                tgt = tgts[ki].long()
-                span = int(torch.max(torch.abs(tgt.float() - src.float())).item())
-                half = span + margin
-                P = max(2 * half + 1, 64)
-                y0 = int(src[0]) - half; x0 = int(src[1]) - half
-                y1 = y0 + P; x1 = x0 + P
-                yy0, xx0 = max(y0, 0), max(x0, 0)
-                yy1, xx1 = min(y1, H_r), min(x1, W_r)
-                roi = F.pad(rp[yy0:yy1, xx0:xx1], (xx0-x0, x1-xx1, yy0-y0, y1-yy1), value=0.0)
-                sr_y = max(0, min(int(src[0])-y0, P-1))
-                sr_x = max(0, min(int(src[1])-x0, P-1))
-                tr_y = max(0, min(int(tgt[0])-y0, P-1))
-                tr_x = max(0, min(int(tgt[1])-x0, P-1))
-                ds = max(min_ds, math.ceil(P / max(n_iters, 1)))
-                if ds > 1:
-                    P_pad = math.ceil(P / ds) * ds
-                    if P_pad > P:
-                        roi = F.pad(roi, (0, P_pad-P, 0, P_pad-P), value=0.0)
-                    roi_c = F.avg_pool2d(roi[None, None], kernel_size=ds, stride=ds).squeeze()
-                    cost = self.model._road_prob_to_cost(roi_c)
-                    Pc = cost.shape[0]
-                    sc_y, sc_x = max(0, min(sr_y//ds, Pc-1)), max(0, min(sr_x//ds, Pc-1))
-                    tc_y, tc_x = max(0, min(tr_y//ds, Pc-1)), max(0, min(tr_x//ds, Pc-1))
-                    smask = torch.zeros(1, Pc, Pc, dtype=torch.bool, device=device)
-                    smask[0, sc_y, sc_x] = True
-                    cfg = EikonalConfig(n_iters=n_iters, h=float(ds), tau_min=0.03,
-                                        tau_branch=0.05, tau_update=0.03, use_redblack=True, monotone=True)
-                    T = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)
-                    vals.append(float(T[0, tc_y, tc_x].item()))
-                else:
-                    cost = self.model._road_prob_to_cost(roi)
-                    smask = torch.zeros(1, P, P, dtype=torch.bool, device=device)
-                    smask[0, sr_y, sr_x] = True
-                    cfg = EikonalConfig(n_iters=n_iters, h=1.0, tau_min=0.03,
-                                        tau_branch=0.05, tau_update=0.03, use_redblack=True, monotone=True)
-                    T = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)
-                    vals.append(float(T[0, tr_y, tr_x].item()))
+
+            span_max = int(torch.max(torch.abs(tgts.float() - src.float())).item())
+            half = span_max + margin
+            P = max(2 * half + 1, 64)
+            y0 = int(src[0]) - half;  x0 = int(src[1]) - half
+            y1 = y0 + P;              x1 = x0 + P
+            yy0, xx0 = max(y0, 0), max(x0, 0)
+            yy1, xx1 = min(y1, H_r), min(x1, W_r)
+            roi = F.pad(rp[yy0:yy1, xx0:xx1],
+                        (xx0 - x0, x1 - xx1, yy0 - y0, y1 - yy1), value=0.0)
+            sr_y = max(0, min(int(src[0]) - y0, P - 1))
+            sr_x = max(0, min(int(src[1]) - x0, P - 1))
+
+            ds = max(min_ds, math.ceil(P / max(n_iters, 1)))
+            if ds > 1:
+                P_pad = math.ceil(P / ds) * ds
+                if P_pad > P:
+                    roi = F.pad(roi, (0, P_pad - P, 0, P_pad - P), value=0.0)
+                roi_c = F.avg_pool2d(roi[None, None], kernel_size=ds, stride=ds).squeeze()
+                cost = self.model._road_prob_to_cost(roi_c)
+                Pc = cost.shape[0]
+                sc_y = max(0, min(sr_y // ds, Pc - 1))
+                sc_x = max(0, min(sr_x // ds, Pc - 1))
+                smask = torch.zeros(1, Pc, Pc, dtype=torch.bool, device=device)
+                smask[0, sc_y, sc_x] = True
+                cfg = EikonalConfig(n_iters=n_iters, h=float(ds), tau_min=0.03,
+                                    tau_branch=0.05, tau_update=0.03,
+                                    use_redblack=True, monotone=True)
+                T = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)[0]
+                vals = []
+                for ki in range(K):
+                    tr_y = max(0, min((int(tgts[ki, 0]) - y0) // ds, Pc - 1))
+                    tr_x = max(0, min((int(tgts[ki, 1]) - x0) // ds, Pc - 1))
+                    vals.append(float(T[tr_y, tr_x].item()))
+            else:
+                cost = self.model._road_prob_to_cost(roi)
+                smask = torch.zeros(1, P, P, dtype=torch.bool, device=device)
+                smask[0, sr_y, sr_x] = True
+                cfg = EikonalConfig(n_iters=n_iters, h=1.0, tau_min=0.03,
+                                    tau_branch=0.05, tau_update=0.03,
+                                    use_redblack=True, monotone=True)
+                T = eikonal_soft_sweeping(cost.unsqueeze(0), smask, cfg)[0]
+                vals = []
+                for ki in range(K):
+                    tr_y = max(0, min(int(tgts[ki, 0]) - y0, P - 1))
+                    tr_x = max(0, min(int(tgts[ki, 1]) - x0, P - 1))
+                    vals.append(float(T[tr_y, tr_x].item()))
             return np.array(vals, dtype=np.float64)
 
         sp_acc, kd_acc, pw_acc = [], [], []

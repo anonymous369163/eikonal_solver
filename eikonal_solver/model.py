@@ -1599,22 +1599,19 @@ class SAMRoute(SAMRoad):
         """
         Differentiable one-src → K-targets Eikonal solve for training.
 
-        For each batch element b, ONE ROI solve is run (sized to cover all
-        valid K targets), then T values are read at all K target locations.
-        This gives K supervision signals per Eikonal computation instead of
-        the previous 1-per-solve, achieving K× more efficient use of the
-        expensive iterative solver.
+        Batched across the full batch B:
+          1. Compute per-element ROI geometry (P_b, ds_b) independently.
+          2. Use ds_common = max(ds_b) so all coarse grids share the same cell
+             size, enabling a single _eikonal_soft_sweeping_diff call on a
+             [B, P_c, P_c] tensor instead of B sequential calls.
+          3. Read K target T-values per element from the batched T field.
 
-        Padding entries (gt_dist_k[b, k] <= 0) are included in the gather
-        but their T values are not used for loss (caller masks them out with
-        the valid = gt_dist_k > 0 mask).
+        Elements with no valid targets are handled by a sentinel cost/src.
 
-        Uses the same adaptive downsampling as _roi_eikonal_solve so the
-        wave-front always reaches the farthest valid target regardless of
-        distance.
-
-        Returns [B, K] tensor where padding positions hold cfg.large_val.
+        Returns [B, K] tensor; padding positions hold cfg.large_val.
         """
+        from dataclasses import replace as _replace
+
         B, H, W = road_prob.shape
         K       = tgt_yx_k.shape[1]
         device  = road_prob.device
@@ -1624,28 +1621,49 @@ class SAMRoute(SAMRoad):
         n_iters = int(cfg.n_iters)
         large_val = float(cfg.large_val)
 
-        all_dists: list = []
-
+        # ------------------------------------------------------------------ #
+        # Pass 1: compute per-element ROI geometry                            #
+        # ------------------------------------------------------------------ #
+        geom = []   # list of (y0, x0, P, src_rel_y, src_rel_x, ds, valid_mask_b)
         for b in range(B):
-            prob_b     = road_prob[b]      # [H, W]
-            src        = src_yx[b].long()  # [2]
-            tgts       = tgt_yx_k[b]       # [K, 2]
-            valid_mask = gt_dist_k[b] > 0  # [K] bool
+            src        = src_yx[b].long()
+            tgts       = tgt_yx_k[b]
+            valid_mask = gt_dist_k[b] > 0
 
-            if not valid_mask.any():
-                all_dists.append(
-                    torch.full((K,), large_val, device=device, dtype=prob_b.dtype))
-                continue
+            if valid_mask.any():
+                valid_tgts = tgts[valid_mask]
+                span_max   = int(torch.max(torch.abs(
+                    valid_tgts.float() - src.float())).item())
+            else:
+                span_max = 0
 
-            # ROI sized to cover src + all VALID targets
-            valid_tgts = tgts[valid_mask]  # [V, 2]
-            span_max   = int(torch.max(torch.abs(
-                valid_tgts.float() - src.float())).item())
             half = span_max + margin
             P    = max(2 * half + 1, 64)
+            y0   = int(src[0].item()) - half
+            x0   = int(src[1].item()) - half
+            sr_y = max(0, min(int(src[0].item()) - y0, P - 1))
+            sr_x = max(0, min(int(src[1].item()) - x0, P - 1))
+            ds   = max(min_ds, int(_math.ceil(P / max(n_iters, 1))))
+            geom.append((y0, x0, P, sr_y, sr_x, ds, valid_mask))
 
-            y0 = int(src[0].item()) - half;  x0 = int(src[1].item()) - half
-            y1 = y0 + P;                     x1 = x0 + P
+        # ------------------------------------------------------------------ #
+        # Pass 2: common downsample factor and coarse-grid size               #
+        # ------------------------------------------------------------------ #
+        ds_common = max(g[5] for g in geom)
+        # P_c = coarse grid side length for the largest ROI
+        P_max = max(g[2] for g in geom)
+        P_c   = int(_math.ceil(P_max / ds_common))
+
+        # ------------------------------------------------------------------ #
+        # Pass 3: build batched cost [B, P_c, P_c] and src_mask [B, P_c, P_c]#
+        # ------------------------------------------------------------------ #
+        costs_list = []
+        src_mask   = torch.zeros(B, P_c, P_c, dtype=torch.bool, device=device)
+
+        for b in range(B):
+            y0, x0, P, sr_y, sr_x, _ds_b, valid_mask = geom[b]
+            y1, x1   = y0 + P, x0 + P
+            prob_b   = road_prob[b]
 
             yy0 = max(y0, 0); xx0 = max(x0, 0)
             yy1 = min(y1, H); xx1 = min(x1, W)
@@ -1656,79 +1674,61 @@ class SAMRoute(SAMRoad):
                 value=0.0,
             )  # [P, P]
 
-            src_rel_y = max(0, min(int(src[0].item()) - y0, P - 1))
-            src_rel_x = max(0, min(int(src[1].item()) - x0, P - 1))
+            # Pad P to a multiple of ds_common before pooling
+            P_pad = int(_math.ceil(P / ds_common) * ds_common)
+            if P_pad > P:
+                patch = F.pad(patch, (0, P_pad - P, 0, P_pad - P), value=0.0)
 
-            # Adaptive downsample: P_coarse <= n_iters guarantees wave-front
-            # always reaches the farthest valid target
-            ds = max(min_ds, int(_math.ceil(P / max(n_iters, 1))))
+            patch_c = F.avg_pool2d(
+                patch.unsqueeze(0).unsqueeze(0), kernel_size=ds_common, stride=ds_common
+            ).squeeze(0).squeeze(0)  # [ceil(P/ds), ceil(P/ds)]
 
-            if ds > 1:
-                P_pad = int(_math.ceil(P / ds) * ds)
-                if P_pad > P:
-                    patch = F.pad(patch, (0, P_pad - P, 0, P_pad - P), value=0.0)
+            # Pad to the common P_c × P_c size (zero-cost = high cost after conversion)
+            ph, pw = patch_c.shape
+            if ph < P_c or pw < P_c:
+                patch_c = F.pad(patch_c, (0, P_c - pw, 0, P_c - ph), value=0.0)
 
-                patch_coarse = F.avg_pool2d(
-                    patch.unsqueeze(0).unsqueeze(0), kernel_size=ds, stride=ds
-                ).squeeze(0).squeeze(0)  # [P_c, P_c]
+            costs_list.append(self._road_prob_to_cost(patch_c))  # [P_c, P_c]
 
-                cost_coarse = self._road_prob_to_cost(patch_coarse)
-                P_c = cost_coarse.shape[0]
+            sc_y = max(0, min(sr_y // ds_common, P_c - 1))
+            sc_x = max(0, min(sr_x // ds_common, P_c - 1))
+            src_mask[b, sc_y, sc_x] = True
 
-                src_c_y = max(0, min(src_rel_y // ds, P_c - 1))
-                src_c_x = max(0, min(src_rel_x // ds, P_c - 1))
+        cost_batch = torch.stack(costs_list)  # [B, P_c, P_c]
 
-                src_mask_b = torch.zeros(1, P_c, P_c, dtype=torch.bool, device=device)
-                src_mask_b[0, src_c_y, src_c_x] = True
+        # ------------------------------------------------------------------ #
+        # Pass 4: single batched differentiable Eikonal solve                 #
+        # ------------------------------------------------------------------ #
+        cfg_common = _replace(cfg, h=float(ds_common))
+        T_all = _eikonal_soft_sweeping_diff(
+            cost_batch,
+            src_mask,
+            cfg_common,
+            checkpoint_chunk=self.route_ckpt_chunk,
+            gate_alpha=self.route_gate_alpha,
+        )  # [B, P_c, P_c]
 
-                from dataclasses import replace
-                cfg_coarse = replace(cfg, h=float(ds))
+        # ------------------------------------------------------------------ #
+        # Pass 5: read K target T-values per element                          #
+        # ------------------------------------------------------------------ #
+        all_dists: list = []
+        for b in range(B):
+            y0, x0, P, _sr_y, _sr_x, _ds_b, valid_mask = geom[b]
+            tgts    = tgt_yx_k[b]
+            T_b     = T_all[b]
 
-                T_b = _eikonal_soft_sweeping_diff(
-                    cost_coarse.unsqueeze(0),
-                    src_mask_b,
-                    cfg_coarse,
-                    checkpoint_chunk=self.route_ckpt_chunk,
-                    gate_alpha=self.route_gate_alpha,
-                )[0]  # [P_c, P_c]
-
-                dists_b = []
-                for k in range(K):
-                    if valid_mask[k]:
-                        ty = int(tgts[k, 0].item())
-                        tx = int(tgts[k, 1].item())
-                        tc_y = max(0, min((ty - y0) // ds, P_c - 1))
-                        tc_x = max(0, min((tx - x0) // ds, P_c - 1))
-                        dists_b.append(T_b[tc_y, tc_x])
-                    else:
-                        dists_b.append(
-                            torch.tensor(large_val, device=device, dtype=T_b.dtype))
-            else:
-                cost_patch = self._road_prob_to_cost(patch)
-
-                src_mask_b = torch.zeros(1, P, P, dtype=torch.bool, device=device)
-                src_mask_b[0, src_rel_y, src_rel_x] = True
-
-                T_b = _eikonal_soft_sweeping_diff(
-                    cost_patch.unsqueeze(0),
-                    src_mask_b,
-                    cfg,
-                    checkpoint_chunk=self.route_ckpt_chunk,
-                    gate_alpha=self.route_gate_alpha,
-                )[0]  # [P, P]
-
-                dists_b = []
-                for k in range(K):
-                    if valid_mask[k]:
-                        ty = int(tgts[k, 0].item())
-                        tx = int(tgts[k, 1].item())
-                        tr_y = max(0, min(ty - y0, P - 1))
-                        tr_x = max(0, min(tx - x0, P - 1))
-                        dists_b.append(T_b[tr_y, tr_x])
-                    else:
-                        dists_b.append(
-                            torch.tensor(large_val, device=device, dtype=T_b.dtype))
-
+            dists_b = []
+            for k in range(K):
+                if valid_mask[k]:
+                    ty = int(tgts[k, 0].item())
+                    tx = int(tgts[k, 1].item())
+                    tc_y = max(0, min((ty - y0) // ds_common, P_c - 1))
+                    tc_x = max(0, min((tx - x0) // ds_common, P_c - 1))
+                    dists_b.append(T_b[tc_y, tc_x])
+                else:
+                    dists_b.append(
+                        torch.tensor(large_val, device=device,
+                                     dtype=cost_batch.dtype))
             all_dists.append(torch.stack(dists_b))
 
         return torch.stack(all_dists)  # [B, K]
