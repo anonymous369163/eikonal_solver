@@ -374,7 +374,8 @@ class SpearmanEvalCallback(pl.Callback):
             src=anc_global,
             tgts=tgts_global,
             T_patch=T_patch,
-            y0=y0 + py0, x0=x0 + px0, P=P,
+            t_y0=y0 + py0, t_x0=x0 + px0, P=P,
+            patch_y0=py0, patch_x0=px0, patch_h=H_r, patch_w=W_r,
             paths_global=paths_global,
             t_vals=t_vals,
             nn_np=nn_np,
@@ -384,8 +385,17 @@ class SpearmanEvalCallback(pl.Callback):
 
 
 def _plot_paths_standalone(rgb, road_prob, src, tgts, T_patch,
-                           y0, x0, P, paths_global, t_vals, nn_np, save_path):
-    """Standalone path visualization (no model required)."""
+                           t_y0, t_x0, P,
+                           patch_y0, patch_x0, patch_h, patch_w,
+                           paths_global, t_vals, nn_np, save_path):
+    """Standalone path visualization (no model required).
+
+    Coordinate convention (all in full-downsampled-image pixel space, scale_img=1):
+      t_y0/t_x0/P  – top-left + size of the Eikonal T-field ROI (for T overlay).
+      patch_y0/patch_x0/patch_h/patch_w – extent of road_prob PATCH (for white box).
+      paths_global – list of [(y,x), ...] in full-image pixel space.
+      src, tgts    – (y,x) tensors in full-image pixel space.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -397,18 +407,17 @@ def _plot_paths_standalone(rgb, road_prob, src, tgts, T_patch,
         rgb = rgb[0]
     img_np = (rgb.detach().float().cpu().permute(1, 2, 0).numpy() * 255).astype("uint8")
     H_img, W_img = img_np.shape[:2]
-    H, W = road_prob.shape
-    scale_img = H_img / max(H, 1)
+    # road_prob is full-size (H_img × W_img), so scale_img == 1.0 always.
     road_np = road_prob.detach().float().cpu().numpy()
     T_np = T_patch.detach().float().cpu().numpy()
     K = tgts.shape[0]
-    y1, x1 = y0 + P, x0 + P
 
-    T_full = np.full((H_img, W_img), np.nan, dtype=np.float32)
-    iy0, ix0 = max(0, int(y0 * scale_img)), max(0, int(x0 * scale_img))
-    iy1 = min(H_img, int(np.ceil(y1 * scale_img)))
-    ix1 = min(W_img, int(np.ceil(x1 * scale_img)))
+    # Place T-field in a full-size canvas (NaN outside the ROI).
+    t_y1, t_x1 = t_y0 + P, t_x0 + P
+    iy0 = max(0, t_y0);  ix0 = max(0, t_x0)
+    iy1 = min(H_img, t_y1); ix1 = min(W_img, t_x1)
     rh, rw = iy1 - iy0, ix1 - ix0
+    T_full = np.full((H_img, W_img), np.nan, dtype=np.float32)
     if rh > 0 and rw > 0:
         T_full[iy0:iy1, ix0:ix1] = F.interpolate(
             torch.from_numpy(T_np)[None, None], size=(rh, rw),
@@ -418,33 +427,38 @@ def _plot_paths_standalone(rgb, road_prob, src, tgts, T_patch,
     vmin = float(np.min(T_full[finite])) if finite.any() else 0.0
     vmax = float(np.percentile(T_full[finite], 99)) if finite.any() else 1.0
 
+    # White dashed box aligns with the road_prob patch boundary.
+    bx0 = max(0, patch_x0);          by0 = max(0, patch_y0)
+    bx1 = min(W_img, patch_x0 + patch_w); by1 = min(H_img, patch_y0 + patch_h)
+
     colors = plt.cm.tab10(np.linspace(0, 1, max(K, 1)))
     fig, ax = plt.subplots(figsize=(14, 14))
     ax.imshow(img_np)
     masked_road = np.ma.masked_where(road_np < 0.1, road_np)
     ax.imshow(masked_road, cmap="Reds", vmin=0, vmax=1, alpha=0.4)
     ax.imshow(T_full, cmap="magma", vmin=vmin, vmax=vmax, alpha=0.32)
-    ax.plot([ix0, ix1, ix1, ix0, ix0], [iy0, iy0, iy1, iy1, iy0],
+    # White box = patch boundary (matches red road overlay extent).
+    ax.plot([bx0, bx1, bx1, bx0, bx0], [by0, by0, by1, by1, by0],
             color="white", lw=1.5, ls="--", alpha=0.75, zorder=8)
 
     for ki, path in enumerate(paths_global):
         if path is not None:
-            ys = [p[0] * scale_img for p in path]
-            xs = [p[1] * scale_img for p in path]
+            ys = [p[0] for p in path]
+            xs = [p[1] for p in path]
             ax.plot(xs, ys, color=colors[ki], lw=2.0, alpha=0.85, zorder=10,
                     path_effects=[pe.Stroke(linewidth=3.5, foreground="black", alpha=0.5),
                                   pe.Normal()])
 
     for ki in range(K):
-        ty = int(tgts[ki, 0].item() * scale_img)
-        tx = int(tgts[ki, 1].item() * scale_img)
+        ty = int(tgts[ki, 0].item())
+        tx = int(tgts[ki, 1].item())
         tval = t_vals[ki]
         lbl = f"node {nn_np[ki]}  T={tval:.0f}" if np.isfinite(tval) else f"node {nn_np[ki]}"
         ax.scatter([tx], [ty], s=220, marker="x", color=colors[ki],
                    linewidths=2.5, zorder=14, label=lbl)
 
-    sy = int(src[0].item() * scale_img)
-    sx_img = int(src[1].item() * scale_img)
+    sy = int(src[0].item())
+    sx_img = int(src[1].item())
     ax.scatter([sx_img], [sy], s=300, marker="o", color="lime",
                edgecolors="black", linewidths=2.5, zorder=15, label="Source")
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=8.5, framealpha=0.9)
