@@ -140,18 +140,23 @@ def eikonal_soft_sweeping(
     source_mask: Optional[torch.Tensor],
     cfg: EikonalConfig,
     source_yx: Optional[Tuple[int, int]] = None,
-) -> torch.Tensor:
+    return_convergence: bool = False,
+):
     """
     Eikonal soft-sweeping solver (red-black Gauss-Seidel).
 
     Args:
-        cost:        (B, H, W) or (H, W) travel-cost map.
-        source_mask: (B, H, W) bool mask, or None if source_yx is given.
-        cfg:         solver configuration.
-        source_yx:   optional (y, x) for single-point source (faster path).
+        cost:               (B, H, W) or (H, W) travel-cost map.
+        source_mask:        (B, H, W) bool mask, or None if source_yx is given.
+        cfg:                solver configuration.
+        source_yx:          optional (y, x) for single-point source (faster path).
+        return_convergence: if True, also return a list of per-iteration max|ΔT| values
+                            for convergence diagnostics. Signature becomes
+                            (T, conv_curve) instead of just T.
 
     Returns:
-        Distance field T with same shape as input cost.
+        T (distance field) if return_convergence=False, else (T, conv_curve).
+        conv_curve is a list of floats with length n_iters.
     """
     squeeze_back = False
     if cost.dim() == 2:
@@ -184,10 +189,16 @@ def eikonal_soft_sweeping(
         even = ((yy + xx) % 2 == 0)[None, :, :]
         odd = ~even
 
+    conv_curve: list[float] = []
+
     for _ in range(int(cfg.n_iters)):
         if cfg.use_redblack:
             T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
             T_e = softmin_algebraic(T, T_new, tau_update) if cfg.monotone else T_new
+            if return_convergence:
+                # Even half-step: delta on even cells (T only decreases → T - T_e >= 0)
+                delta_e = (T - T_e).clamp_min(0.0)
+                delta_e_finite = delta_e[even & (T < large_val * 0.9)]
             T = torch.where(even, T_e, T)
             if source_yx is not None:
                 T[:, sy, sx] = 0.0
@@ -196,6 +207,16 @@ def eikonal_soft_sweeping(
 
             T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
             T_o = softmin_algebraic(T, T_new, tau_update) if cfg.monotone else T_new
+            if return_convergence:
+                # Odd half-step delta
+                delta_o = (T - T_o).clamp_min(0.0)
+                delta_o_finite = delta_o[odd & (T < large_val * 0.9)]
+                all_deltas = torch.cat([
+                    delta_e_finite.reshape(-1),
+                    delta_o_finite.reshape(-1)
+                ])
+                max_delta = float(all_deltas.max().item()) if all_deltas.numel() > 0 else 0.0
+                conv_curve.append(max_delta)
             T = torch.where(odd, T_o, T)
             if source_yx is not None:
                 T[:, sy, sx] = 0.0
@@ -203,13 +224,22 @@ def eikonal_soft_sweeping(
                 T = torch.where(source_mask, torch.zeros_like(T), T)
         else:
             T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
-            T = softmin_algebraic(T, T_new, tau_update) if cfg.monotone else T_new
+            T_upd = softmin_algebraic(T, T_new, tau_update) if cfg.monotone else T_new
+            if return_convergence:
+                delta = (T - T_upd).clamp_min(0.0)
+                delta_finite = delta[T < large_val * 0.9]
+                max_delta = float(delta_finite.max().item()) if delta_finite.numel() > 0 else 0.0
+                conv_curve.append(max_delta)
+            T = T_upd
             if source_yx is not None:
                 T[:, sy, sx] = 0.0
             else:
                 T = torch.where(source_mask, torch.zeros_like(T), T)
 
-    return T.squeeze(0) if squeeze_back else T
+    T_out = T.squeeze(0) if squeeze_back else T
+    if return_convergence:
+        return T_out, conv_curve
+    return T_out
 
 
 # ---------------------------------------------------------------------------

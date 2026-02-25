@@ -534,16 +534,6 @@ class SAMRoad(pl.LightningModule):
         # [B, N_samples, N_pairs, 1]
         topo_loss = self.topo_criterion(topo_logits, topo_gt.unsqueeze(-1).to(torch.float32))
 
-        #### DEBUG NAN
-        for nan_index in torch.nonzero(torch.isnan(topo_loss[:, :, :, 0])):
-            print('nan index: B, Sample, Pair')
-            print(nan_index)
-            import pdb
-            pdb.set_trace()
-
-        #### DEBUG NAN
-
-
         topo_loss *= topo_loss_mask.unsqueeze(-1)
         # topo_loss = torch.nansum(torch.nansum(topo_loss) / topo_loss_mask.sum())
         topo_loss = topo_loss.sum() / topo_loss_mask.sum()
@@ -794,8 +784,8 @@ def _prob_to_cost_additive(
         p = 0.0  →  cost = 21.0  (+block≈50)
     """
     prob = prob.clamp(0.0, 1.0)
-    # base + polynomial penalty
-    cost = 1.0 + float(alpha) * (1.0 - prob).pow(gamma)
+    # base + polynomial penalty (alpha/gamma may be Tensor for learnable params)
+    cost = 1.0 + alpha * (1.0 - prob).pow(gamma)
     # smooth hard-block near block_th (sigmoid gives a C∞ step)
     if block_th > 0.0 and block_alpha > 0.0:
         block = float(block_alpha) * torch.sigmoid(
@@ -803,6 +793,23 @@ def _prob_to_cost_additive(
         )
         cost = cost + block
     return cost.clamp_min(eps)
+
+
+def _mix_eikonal_euclid(
+    T_eik: torch.Tensor,
+    d_euc: torch.Tensor,
+    gate_logit: torch.Tensor,
+    gate_min: float = 0.3,
+    gate_max: float = 0.95,
+) -> torch.Tensor:
+    """Blend Eikonal T-values with Euclidean distances via learnable gate.
+
+    Uses residual form:  pred = d_euc + gate * (T_eik - d_euc)
+      gate=1 → pure Eikonal,  gate=0 → pure Euclidean.
+    Gate is clamped to [gate_min, gate_max] to prevent degeneration.
+    """
+    gate = torch.sigmoid(gate_logit).clamp(gate_min, gate_max)
+    return d_euc + gate * (T_eik - d_euc)
 
 
 def _eikonal_iter_chunk(
@@ -1003,9 +1010,13 @@ class SAMRoute(SAMRoad):
         self.route_offroad_penalty  = float(_cfg(config, "ROUTE_OFFROAD_PENALTY",   100.0))
         self.route_block_th         = float(_cfg(config, "ROUTE_BLOCK_TH",          0.05))
         self.route_block_smooth     = float(_cfg(config, "ROUTE_BLOCK_SMOOTH",      50.0))
-        # --- additive-mode params ---
-        self.route_add_alpha        = float(_cfg(config, "ROUTE_ADD_ALPHA",         20.0))
-        self.route_add_gamma        = float(_cfg(config, "ROUTE_ADD_GAMMA",         2.0))
+        # --- additive-mode params (alpha/gamma are learnable nn.Parameters) ---
+        _alpha_init = float(_cfg(config, "ROUTE_ADD_ALPHA", 20.0))
+        _gamma_init = float(_cfg(config, "ROUTE_ADD_GAMMA", 2.0))
+        self.cost_log_alpha = torch.nn.Parameter(
+            torch.tensor(_math.log(max(_alpha_init, 1e-3))))
+        self.cost_log_gamma = torch.nn.Parameter(
+            torch.tensor(_math.log(max(_gamma_init, 1e-3))))
         self.route_add_block_alpha  = float(_cfg(config, "ROUTE_ADD_BLOCK_ALPHA",   50.0))
         self.route_add_block_smooth = float(_cfg(config, "ROUTE_ADD_BLOCK_SMOOTH",  50.0))
         self.route_eps              = float(_cfg(config, "ROUTE_EPS",               1e-6))
@@ -1030,6 +1041,12 @@ class SAMRoute(SAMRoad):
         self.route_gate_alpha        = float(_cfg(config,"ROUTE_GATE_ALPHA",        0.8))
         self.route_eik_downsample    = int(_cfg(config,  "ROUTE_EIK_DOWNSAMPLE",   4))
         self.route_k_targets         = int(_cfg(config,  "ROUTE_K_TARGETS",        4))
+
+        # Learnable Eikonal-Euclidean blending gate (residual form)
+        _gate_init = float(_cfg(config, "ROUTE_EIK_GATE_INIT", 0.80))
+        _gate_init = max(0.01, min(0.99, _gate_init))
+        self.eik_gate_logit = torch.nn.Parameter(
+            torch.tensor(_math.log(_gate_init / (1.0 - _gate_init))))
 
         # pos_weight compensates for class imbalance (road density ~6-7%).
         # With ~6.7% road pixels: pos_weight = 0.933/0.067 ≈ 13.9 balances the loss.
@@ -1119,11 +1136,15 @@ class SAMRoute(SAMRoad):
                 block_smooth    = self.route_block_smooth,
                 eps             = self.route_eps,
             )
-        # default: "add"
+        # default: "add" — alpha/gamma are learnable (log-space + clamp)
+        alpha = self.cost_log_alpha.clamp(
+            _math.log(5.0), _math.log(100.0)).exp()
+        gamma = self.cost_log_gamma.clamp(
+            _math.log(0.5), _math.log(4.0)).exp()
         return _prob_to_cost_additive(
             road_prob,
-            alpha        = self.route_add_alpha,
-            gamma        = self.route_add_gamma,
+            alpha        = alpha,
+            gamma        = gamma,
             block_th     = self.route_block_th,
             block_alpha  = self.route_add_block_alpha,
             block_smooth = self.route_add_block_smooth,
@@ -1138,18 +1159,12 @@ class SAMRoute(SAMRoad):
         eik_cfg: "EikonalConfig | None" = None,
     ) -> torch.Tensor:
         """
-        Adaptive multi-resolution ROI-cropped differentiable Eikonal solve.
+        Fixed-ds ROI-cropped differentiable Eikonal solve.
 
-        Key insight (GPPN-inspired): instead of a fixed downsample factor, we
-        compute ds *per sample* so that the coarse patch size P_c <= n_iters.
-        This guarantees the wavefront always reaches the target regardless of
-        the source-target distance.
-
-        ds = max(min_ds, ceil(P / n_iters))
-
-        For example: P=1129, n_iters=100 → ds=12, P_c=95 ≤ 100.
-        The Eikonal h parameter is set to ds, so T values are in original
-        pixel units.
+        ds is fixed to ROUTE_EIK_DOWNSAMPLE (decoupled from n_iters).
+        n_iters only controls solver convergence, not grid resolution.
+        Require n_iters >= P/ds for full convergence; partial convergence
+        is acceptable during early training (warmup).
 
         Returns:
             dist: [B]  predicted distance in original pixel units
@@ -1188,8 +1203,7 @@ class SAMRoute(SAMRoad):
             tgt_rel_y = max(0, min(int(tgt[0].item()) - y0, P - 1))
             tgt_rel_x = max(0, min(int(tgt[1].item()) - x0, P - 1))
 
-            # Adaptive ds: ensure P_coarse <= n_iters so wavefront always reaches target
-            ds = max(min_ds, int(_math.ceil(P / max(n_iters, 1))))
+            ds = min_ds
 
             if ds > 1:
                 P_pad = int(_math.ceil(P / ds) * ds)
@@ -1239,7 +1253,11 @@ class SAMRoute(SAMRoad):
 
                 dists.append(T_b[0, tgt_rel_y, tgt_rel_x])
 
-        return torch.stack(dists)  # [B]
+        T_eik = torch.stack(dists)  # [B]
+
+        # Euclidean residual blending
+        d_euc = ((src_yx.float() - tgt_yx.float()) ** 2).sum(-1).sqrt()  # [B]
+        return _mix_eikonal_euclid(T_eik, d_euc, self.eik_gate_logit)
 
     # ------------------------------------------------------------------
     # forward
@@ -1457,6 +1475,16 @@ class SAMRoute(SAMRoad):
             self.log("eik_iters_eff", float(eik_cfg.n_iters), on_step=True, on_epoch=False)
 
             with torch.no_grad():
+                _a = self.cost_log_alpha.clamp(
+                    _math.log(5.0), _math.log(100.0)).exp()
+                _g = self.cost_log_gamma.clamp(
+                    _math.log(0.5), _math.log(4.0)).exp()
+                _gate = torch.sigmoid(self.eik_gate_logit).clamp(0.3, 0.95)
+                self.log("cost_alpha", _a, on_step=False, on_epoch=True)
+                self.log("cost_gamma", _g, on_step=False, on_epoch=True)
+                self.log("eik_gate", _gate, on_step=False, on_epoch=True)
+
+            with torch.no_grad():
                 valid_pred = pred_dist_raw[valid] if valid.any() else pred_dist_raw.flatten()[:1]
                 valid_gt   = gt_dist[valid]        if valid.any() else gt_dist.flatten()[:1]
                 self.log("pred_dist_mean", valid_pred.mean(), on_step=True, on_epoch=False)
@@ -1577,6 +1605,14 @@ class SAMRoute(SAMRoad):
                 'lr': self.config.BASE_LR,
             })
 
+        if self.route_lambda_dist > 0:
+            eik_params = [self.cost_log_alpha, self.cost_log_gamma,
+                          self.eik_gate_logit]
+            param_dicts.append({
+                'params': eik_params,
+                'lr': self.config.BASE_LR,
+            })
+
         for i, pd in enumerate(param_dicts):
             print(f'[SAMRoute] param group {i}: {sum(p.numel() for p in pd["params"])} params')
 
@@ -1645,7 +1681,7 @@ class SAMRoute(SAMRoad):
             x0   = int(src[1].item()) - half
             sr_y = max(0, min(int(src[0].item()) - y0, P - 1))
             sr_x = max(0, min(int(src[1].item()) - x0, P - 1))
-            ds   = max(min_ds, int(_math.ceil(P / max(n_iters, 1))))
+            ds   = min_ds
             geom.append((y0, x0, P, sr_y, sr_x, ds, valid_mask))
 
         # ------------------------------------------------------------------ #
@@ -1733,7 +1769,12 @@ class SAMRoute(SAMRoad):
                                      dtype=cost_batch.dtype))
             all_dists.append(torch.stack(dists_b))
 
-        return torch.stack(all_dists)  # [B, K]
+        T_eik = torch.stack(all_dists)  # [B, K]
+
+        # Euclidean residual blending
+        d_euc = ((src_yx.unsqueeze(1).float() - tgt_yx_k.float()) ** 2
+                 ).sum(-1).sqrt()  # [B, K]
+        return _mix_eikonal_euclid(T_eik, d_euc, self.eik_gate_logit)
 
     # ------------------------------------------------------------------
     # Inference: one source → many targets (single Eikonal solve)

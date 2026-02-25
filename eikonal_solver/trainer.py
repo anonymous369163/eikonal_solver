@@ -57,6 +57,10 @@ class SpearmanEvalCallback(pl.Callback):
 
     Computes both model-predicted and Euclidean-baseline Spearman coefficients.
     When a new best mean Spearman is achieved, saves a path-visualization PNG.
+
+    Uses full-resolution road probability maps for accurate evaluation:
+    - Cached encoder features + decoder (fast, primary path)
+    - Tiled encoder inference as fallback (when features not cached)
     """
 
     def __init__(self, image_path: str, eval_every_n_epochs: int = 10,
@@ -73,7 +77,10 @@ class SpearmanEvalCallback(pl.Callback):
         self._scale = 1.0
         self._rp_cache: dict = {}
         self._gt_mask_ds = None
-        self._best_spearman = float("-inf")  # track best for visualization trigger
+        self._best_spearman = float("-inf")
+        self._cached_feat = None   # [C, Hf, Wf] cached encoder features
+        self._H_orig = 0
+        self._W_orig = 0
 
     def on_train_epoch_end(self, trainer: "pl.Trainer", pl_module) -> None:
         epoch = trainer.current_epoch + 1
@@ -111,9 +118,21 @@ class SpearmanEvalCallback(pl.Callback):
         import glob as _glob
         import torch.nn.functional as F
         from PIL import Image as _PILImage
+        import numpy as _np
 
         rgb = load_tif_image(self.image_path).to(device)
         _, _, H, W = rgb.shape
+        self._H_orig = H
+        self._W_orig = W
+
+        # Try loading cached encoder features for full-resolution evaluation
+        region_dir = os.path.dirname(self.image_path)
+        feat_files = sorted(_glob.glob(os.path.join(region_dir, "samroad_feat_full_*.npy")))
+        if feat_files:
+            self._cached_feat = _np.load(feat_files[0])  # [C, Hf, Wf]
+            print(f"[SpearmanEval] Loaded cached features: {self._cached_feat.shape}")
+
+        # Still keep downsampled RGB for fallback & visualization
         scale = 1.0
         if self.downsample > 0 and max(H, W) > self.downsample:
             scale = self.downsample / max(H, W)
@@ -122,36 +141,57 @@ class SpearmanEvalCallback(pl.Callback):
         self._rgb_ds = rgb
         self._scale = scale
 
-        # Load GT road mask from the same region directory as the TIF.
-        # Prefer the original thin roadnet PNG (most truthful GT).
-        region_dir = os.path.dirname(self.image_path)
+        # Load GT road mask
         gt_pngs = sorted(_glob.glob(os.path.join(region_dir, "roadnet_*.png")))
         gt_pngs = [p for p in gt_pngs if "normalized" not in os.path.basename(p)]
         if gt_pngs:
-            import numpy as _np
             _arr = _np.array(_PILImage.open(gt_pngs[0]))
-            _mask = _arr[:, :, 0].astype(_np.float32) / 255.0  # [H, W] float32
-            gt_t = torch.from_numpy(_mask).unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
-            if scale != 1.0:
-                _, _, H_ds, W_ds = rgb.shape
-                gt_t = F.interpolate(gt_t, size=(H_ds, W_ds), mode="bilinear",
-                                     align_corners=False)
-            self._gt_mask_ds = gt_t.squeeze()  # [H_ds, W_ds]
+            _mask = _arr[:, :, 0].astype(_np.float32) / 255.0
+            self._gt_mask_ds = torch.from_numpy(_mask).to(device)  # full-res [H, W]
         else:
             self._gt_mask_ds = None
 
+        # Load nodes at original resolution (will be scaled to eval resolution later)
         rp_dummy = torch.zeros(H, W, device=device)
         nodes_orig, info = load_nodes_from_npz(
             self.image_path, rp_dummy, p_count=20, snap=False, verbose=False)
-        _, _, H_ds, W_ds = rgb.shape
-        if scale != 1.0:
-            nodes_yx = (nodes_orig.float() * scale).long()
-            nodes_yx[:, 0].clamp_(0, H_ds - 1)
-            nodes_yx[:, 1].clamp_(0, W_ds - 1)
-        else:
-            nodes_yx = nodes_orig
-        self._nodes_yx = nodes_yx.to(device)
+        self._nodes_yx = nodes_orig.to(device)  # keep at original resolution
         self._info = info
+
+    @torch.no_grad()
+    def _get_full_road_prob(self, model, device) -> torch.Tensor:
+        """Generate full-resolution road probability map.
+
+        Uses cached encoder features + decoder when available (fast),
+        falls back to tiled encoder inference otherwise.
+        """
+        import torch.nn.functional as F
+
+        if self._cached_feat is not None:
+            feat_t = torch.from_numpy(self._cached_feat).unsqueeze(0).to(device)
+            logits = model.map_decoder(feat_t)
+            return torch.sigmoid(logits)[0, 1].detach()  # [H_dec, W_dec]
+
+        PATCH = int(model.config.get("PATCH_SIZE", 512))
+        stride = PATCH // 2
+        from evaluator import load_tif_image
+        rgb = load_tif_image(self.image_path).to(device)
+        _, _, H, W = rgb.shape
+        accum = torch.zeros(H, W, device=device)
+        count = torch.zeros(H, W, device=device)
+        for y0 in range(0, H, stride):
+            for x0 in range(0, W, stride):
+                y1, x1 = min(y0 + PATCH, H), min(x0 + PATCH, W)
+                patch = rgb[:, :, y0:y1, x0:x1]
+                if patch.shape[2] < PATCH or patch.shape[3] < PATCH:
+                    patch = F.pad(patch, (0, PATCH - patch.shape[3],
+                                         0, PATCH - patch.shape[2]))
+                rgb_hwc = (patch * 255.0).squeeze(0).permute(1, 2, 0).unsqueeze(0)
+                _, ms = model._predict_mask_logits_scores(rgb_hwc)
+                rp = ms[0, :y1-y0, :x1-x0, 1].detach()
+                accum[y0:y1, x0:x1] += rp
+                count[y0:y1, x0:x1] += 1.0
+        return accum / count.clamp(min=1.0)
 
     @torch.no_grad()
     def _evaluate(self, model, epoch: int, vis_dir: str) -> dict:
@@ -163,57 +203,57 @@ class SpearmanEvalCallback(pl.Callback):
         self._ensure_loaded(device)
         self._rp_cache.clear()
 
-        PATCH = int(model.config.get("PATCH_SIZE", 512))
-        margin = int(model.config.get("ROUTE_ROI_MARGIN", 64))
-        n_iters = int(model.config.get("ROUTE_EIK_ITERS", 20))
-        min_ds = int(model.config.get("ROUTE_EIK_DOWNSAMPLE", 8))
+        n_iters  = int(model.config.get("ROUTE_EIK_ITERS", 20))
+        eik_ds   = int(model.config.get("ROUTE_EIK_DOWNSAMPLE", 8))
 
-        nodes_yx = self._nodes_yx
+        # Full-resolution road probability — single max_pool2d inside Eikonal
+        road_prob = self._get_full_road_prob(model, device)
+        H_prob, W_prob = road_prob.shape
+        self._road_prob_full = road_prob
+
+        # Use more iterations for evaluation since full image gives larger grid
+        # Grid = H_prob / eik_ds. Need n_iters ≥ grid/5 for reasonable convergence
+        grid_size = max(H_prob, W_prob) // eik_ds
+        eval_n_iters = max(n_iters, grid_size // 4)
+
+        # Scale nodes from original image to probability map space
+        nodes_orig = self._nodes_yx
+        prob_scale = H_prob / self._H_orig
+        if abs(prob_scale - 1.0) > 0.01:
+            nodes_yx = (nodes_orig.float() * prob_scale).long().to(device)
+            nodes_yx[:, 0].clamp_(0, H_prob - 1)
+            nodes_yx[:, 1].clamp_(0, W_prob - 1)
+        else:
+            nodes_yx = nodes_orig.to(device)
+
         info = self._info
         case = info["case_idx"]
         meta_px = int(info["meta_sat_height_px"])
-        pscale = 1.0 / self._scale if self._scale != 1.0 else 1.0
-        _, _, H_ds, W_ds = self._rgb_ds.shape
         N = nodes_yx.shape[0]
 
+        # Margin for Eikonal ROI: enough room for wave to propagate around obstacles
+        # but not so large that the padded region dominates.
+        EVAL_MARGIN = min(500, H_prob // 4)
+        if epoch <= 5 or epoch % 10 == 0:
+            print(f"  [SpearmanEval] prob_map={H_prob}x{W_prob}  "
+                  f"eik_ds={eik_ds}  grid~{grid_size}  "
+                  f"eval_n_iters={eval_n_iters}  margin={EVAL_MARGIN}")
+
         sp_acc, kd_acc, pw_acc, sp_euc_acc = [], [], [], []
-        # Track the anchor with the highest single-anchor model Spearman for visualization
         best_anchor_sp = float("-inf")
         best_vis_data = None
 
         for anc_idx in range(N):
             _, nn_global = pick_anchor_and_knn(nodes_yx, k=self.k, anchor_idx=anc_idx)
             anc = nodes_yx[anc_idx]
-            ay, ax = int(anc[0]), int(anc[1])
-            py0 = max(0, min(ay - PATCH // 2, H_ds - PATCH))
-            px0 = max(0, min(ax - PATCH // 2, W_ds - PATCH))
-            py1, px1 = py0 + PATCH, px0 + PATCH
             tgts_g = nodes_yx[nn_global]
-            in_p = ((tgts_g[:, 0] >= py0) & (tgts_g[:, 0] < py1) &
-                    (tgts_g[:, 1] >= px0) & (tgts_g[:, 1] < px1))
-            keep = torch.where(in_p)[0]
-            if keep.numel() < self.min_in_patch:
-                continue
-            nn_kept = nn_global[keep]
-            tgt_patch = tgts_g[keep] - torch.tensor([py0, px0], device=device)
-            anc_patch = torch.tensor([ay - py0, ax - px0], device=device).long()
 
-            # Cache road-prob per patch (patch boundaries as key)
-            key = (py0, py1, px0, px1)
-            if key not in self._rp_cache:
-                rgb_p = self._rgb_ds[:, :, py0:py1, px0:px1]
-                if rgb_p.shape[2] < PATCH or rgb_p.shape[3] < PATCH:
-                    rgb_p = F.pad(rgb_p, (0, PATCH - rgb_p.shape[3], 0, PATCH - rgb_p.shape[2]))
-                rgb_hwc = (rgb_p * 255.0).squeeze(0).permute(1, 2, 0).unsqueeze(0)
-                _, ms = model._predict_mask_logits_scores(rgb_hwc)
-                self._rp_cache[key] = ms[0, :, :, 1].detach()
-            rp = self._rp_cache[key]
-
-            # One Eikonal solve covering all K targets → read K T-values
+            # Solve on full prob map — all nodes in range
             T_raw = _eikonal_one_src_k_tgts(
-                rp, anc_patch, tgt_patch, model, device, margin, n_iters, min_ds)
-            T_norm = T_raw * pscale / max(meta_px, 1)
-            nn_np = nn_kept.cpu().numpy().astype(int)
+                road_prob, anc, tgts_g, model, device,
+                EVAL_MARGIN, eval_n_iters, eik_ds)
+            T_norm = T_raw / max(meta_px, 1)
+            nn_np = nn_global.cpu().numpy().astype(int)
             gt_arr = np.asarray(info["undirected_dist_norm"][case][anc_idx, nn_np], dtype=np.float64)
             euc_arr = np.asarray(info["euclidean_dist_norm"][case][anc_idx, nn_np], dtype=np.float64)
 
@@ -227,22 +267,21 @@ class SpearmanEvalCallback(pl.Callback):
             kd_acc.append(kendall_tau(pv, gv))
             pw_acc.append(pairwise_order_acc(pv, gv))
 
-            # Euclidean baseline Spearman
             valid_euc = valid & np.isfinite(euc_arr)
             if valid_euc.sum() >= 3:
                 sp_euc_acc.append(spearmanr(euc_arr[valid_euc], gt_arr[valid_euc]))
 
-            # Track best anchor for visualization
             if anc_sp > best_anchor_sp:
                 best_anchor_sp = anc_sp
                 best_vis_data = {
                     "anc_idx": anc_idx,
-                    "anc_patch": anc_patch.clone(),
-                    "tgt_patch": tgt_patch.clone(),
+                    "anc_patch": anc.clone(),
+                    "tgt_patch": tgts_g.clone(),
                     "nn_np": nn_np.copy(),
-                    "rp_key": key,
-                    "py0": py0, "px0": px0,
+                    "rp_key": (0, H_prob, 0, W_prob),
+                    "py0": 0, "px0": 0,
                 }
+                self._rp_cache[(0, H_prob, 0, W_prob)] = road_prob.detach()
 
         if not sp_acc:
             return dict(eval_spearman=float("nan"), eval_spearman_euc=float("nan"),
@@ -258,17 +297,24 @@ class SpearmanEvalCallback(pl.Callback):
             eval_n_anchors=float(len(sp_acc)),
         )
 
-        # Visualize paths when a new best mean Spearman is achieved
         new_best = mean_sp > self._best_spearman
         if new_best and best_vis_data is not None:
             self._best_spearman = mean_sp
             result["_new_best"] = True
             try:
+                gt_vis = None
+                if self._gt_mask_ds is not None:
+                    gt_vis = F.interpolate(
+                        self._gt_mask_ds.unsqueeze(0).unsqueeze(0).float(),
+                        size=(H_prob, W_prob), mode="bilinear",
+                        align_corners=False).squeeze() if self._gt_mask_ds.shape != (H_prob, W_prob) else self._gt_mask_ds
                 self._visualize_best_anchor(model, best_vis_data, epoch,
-                                            mean_sp, vis_dir, device, margin,
-                                            n_iters, min_ds, self._gt_mask_ds)
+                                            mean_sp, vis_dir, device,
+                                            EVAL_MARGIN, eval_n_iters, eik_ds, gt_vis)
             except Exception as ve:
+                import traceback
                 print(f"\n[SpearmanEval] visualization error: {ve}")
+                traceback.print_exc()
         return result
 
     @torch.no_grad()
@@ -309,9 +355,7 @@ class SpearmanEvalCallback(pl.Callback):
         sr_y = max(0, min(int(anc[0]) - y0, P - 1))
         sr_x = max(0, min(int(anc[1]) - x0, P - 1))
 
-        # Use the SAME downsample params as the Spearman evaluation so that
-        # T values and paths in the visualization match actual model behavior.
-        ds = max(min_ds, int(math.ceil(P / max(n_iters, 1))))
+        ds = min_ds
         if ds > 1:
             P_pad = int(math.ceil(P / ds) * ds)
             patch_ds = patch_full
@@ -346,49 +390,89 @@ class SpearmanEvalCallback(pl.Callback):
             if T_patch.dim() == 3:
                 T_patch = T_patch[0]
 
-        # Backtrace paths
-        # y0/x0 are offsets in PATCH space; adding py0/px0 converts to full-image space.
-        src_rel = torch.tensor([sr_y, sr_x], device=device, dtype=torch.long)
-        paths_global, t_vals = [], []
-        for ki in range(K):
-            tr_y = max(0, min(int(tgts[ki, 0]) - y0, P - 1))
-            tr_x = max(0, min(int(tgts[ki, 1]) - x0, P - 1))
-            tval = float(T_patch[tr_y, tr_x].item())
-            t_vals.append(tval)
-            tgt_rel = torch.tensor([tr_y, tr_x], device=device, dtype=torch.long)
-            pp = trace_path_from_T(T_patch, src_rel, tgt_rel, device, diag=True)
-            if len(pp) >= 2:
-                paths_global.append([(p[0] + y0 + py0, p[1] + x0 + px0) for p in pp])
-            else:
-                paths_global.append(None)
+        # Backtrace paths on COARSE grid (avoids flat-region stalls from upsampling),
+        # then scale coordinates by ds to map back to full-image space.
+        if ds > 1:
+            src_c = torch.tensor([sc_y, sc_x], device=device, dtype=torch.long)
+            paths_global, t_vals = [], []
+            for ki in range(K):
+                tc_y = max(0, min((int(tgts[ki, 0]) - y0) // ds, Pc - 1))
+                tc_x = max(0, min((int(tgts[ki, 1]) - x0) // ds, Pc - 1))
+                tval = float(T_coarse[tc_y, tc_x].item())
+                t_vals.append(tval)
+                tgt_c = torch.tensor([tc_y, tc_x], device=device, dtype=torch.long)
+                pp = trace_path_from_T(T_coarse, src_c, tgt_c, device, diag=True)
+                if len(pp) >= 2:
+                    paths_global.append(
+                        [(p[0] * ds + y0 + py0, p[1] * ds + x0 + px0) for p in pp])
+                else:
+                    paths_global.append(None)
+        else:
+            src_rel = torch.tensor([sr_y, sr_x], device=device, dtype=torch.long)
+            paths_global, t_vals = [], []
+            for ki in range(K):
+                tr_y = max(0, min(int(tgts[ki, 0]) - y0, P - 1))
+                tr_x = max(0, min(int(tgts[ki, 1]) - x0, P - 1))
+                tval = float(T_patch[tr_y, tr_x].item())
+                t_vals.append(tval)
+                tgt_rel = torch.tensor([tr_y, tr_x], device=device, dtype=torch.long)
+                pp = trace_path_from_T(T_patch, src_rel, tgt_rel, device, diag=True)
+                if len(pp) >= 2:
+                    paths_global.append([(p[0] + y0 + py0, p[1] + x0 + px0) for p in pp])
+                else:
+                    paths_global.append(None)
 
-        # Build global coordinate tensors for the plotter
-        anc_global = torch.tensor([int(anc[0]) + py0, int(anc[1]) + px0],
-                                  device=device, dtype=torch.long)
-        tgts_global = tgts + torch.tensor([py0, px0], device=device)
-
-        # Build a full-size road_prob (H_ds × W_ds) with the patch placed at its
-        # correct position so that scale_img = H_ds/H_ds = 1.0 inside the plotter
-        # and all coordinate arithmetic stays in the same space.
+        # Scale everything from eval-map space to display (RGB) space
         H_ds, W_ds = self._rgb_ds.shape[-2:]
-        road_prob_full = torch.zeros(H_ds, W_ds, device=rp.device, dtype=rp.dtype)
-        py1_clip = min(py0 + H_r, H_ds)
-        px1_clip = min(px0 + W_r, W_ds)
-        road_prob_full[py0:py1_clip, px0:px1_clip] = rp[:py1_clip - py0, :px1_clip - px0]
+        H_eval = rp.shape[0]
+        vis_scale = H_ds / max(H_eval, 1)
+
+        def _s(v):
+            return int(v * vis_scale)
+
+        anc_global = torch.tensor([_s(int(anc[0])), _s(int(anc[1]))],
+                                  device=device, dtype=torch.long)
+        tgts_global = (tgts.float() * vis_scale).long()
+
+        paths_vis = []
+        for pp in paths_global:
+            if pp is not None:
+                paths_vis.append([(_s(p[0]), _s(p[1])) for p in pp])
+            else:
+                paths_vis.append(None)
+
+        road_prob_vis = F.interpolate(
+            rp.unsqueeze(0).unsqueeze(0), size=(H_ds, W_ds),
+            mode="bilinear", align_corners=False).squeeze()
+
+        gt_vis = gt_mask
+        if gt_vis is not None and gt_vis.shape != (H_ds, W_ds):
+            gt_vis = F.interpolate(
+                gt_vis.unsqueeze(0).unsqueeze(0).float(),
+                size=(H_ds, W_ds), mode="bilinear",
+                align_corners=False).squeeze()
+
+        vis_y0 = _s(y0)
+        vis_x0 = _s(x0)
+        vis_P = _s(P)
 
         os.makedirs(vis_dir, exist_ok=True)
         save_path = os.path.join(vis_dir, f"ep{epoch:03d}_sp{mean_sp:+.4f}.png")
 
+        T_vis = F.interpolate(T_patch.unsqueeze(0).unsqueeze(0),
+                              size=(vis_P, vis_P), mode="bilinear",
+                              align_corners=False).squeeze()
+
         _plot_paths_standalone(
             rgb=self._rgb_ds,
-            road_prob=road_prob_full,
-            gt_mask=gt_mask,
+            road_prob=road_prob_vis,
+            gt_mask=gt_vis,
             src=anc_global,
             tgts=tgts_global,
-            T_patch=T_patch,
-            t_y0=y0 + py0, t_x0=x0 + px0, P=P,
-            patch_y0=py0, patch_x0=px0, patch_h=H_r, patch_w=W_r,
-            paths_global=paths_global,
+            T_patch=T_vis,
+            t_y0=vis_y0, t_x0=vis_x0, P=vis_P,
+            patch_y0=0, patch_x0=0, patch_h=H_ds, patch_w=W_ds,
+            paths_global=paths_vis,
             t_vals=t_vals,
             nn_np=nn_np,
             save_path=save_path,
@@ -530,10 +614,8 @@ def _eikonal_one_src_k_tgts(
 ) -> "np.ndarray":             # [K] float64
     """One Eikonal solve per anchor covering all K targets; read K T-values.
 
-    Replaces the previous per-target inner loop (K separate small-ROI solves).
-    The coarse grid size is the same as before (~n_iters × n_iters) because
-    ds = max(min_ds, ceil(P / n_iters)) bounds P_c ≈ n_iters regardless of P.
-    Total solves per evaluation: N (anchors) instead of N×K.
+    ds is fixed to min_ds (decoupled from n_iters). n_iters controls
+    convergence only. Need n_iters >= P/ds for full convergence.
     """
     import math
     import numpy as np
@@ -561,7 +643,7 @@ def _eikonal_one_src_k_tgts(
     sr_y = max(0, min(int(anc_patch[0]) - y0, P - 1))
     sr_x = max(0, min(int(anc_patch[1]) - x0, P - 1))
 
-    ds = max(min_ds, math.ceil(P / max(n_iters, 1)))
+    ds = min_ds
     if ds > 1:
         P_pad = math.ceil(P / ds) * ds
         if P_pad > P:
@@ -596,7 +678,19 @@ def _eikonal_one_src_k_tgts(
             tr_x = max(0, min(int(tgt_patch[ki, 1]) - x0, P - 1))
             T_vals.append(float(T[tr_y, tr_x].item()))
 
-    return np.array(T_vals, dtype=np.float64)
+    T_arr = np.array(T_vals, dtype=np.float64)
+
+    # Euclidean residual blending (same as model._mix_eikonal_euclid)
+    if hasattr(model, 'eik_gate_logit'):
+        import math as _m
+        gate_logit = float(model.eik_gate_logit.detach().cpu().item())
+        gate = min(0.95, max(0.3, 1.0 / (1.0 + _m.exp(-gate_logit))))
+        d_euc = np.sqrt(((anc_patch.cpu().numpy().astype(np.float64)
+                          - tgt_patch.cpu().numpy().astype(np.float64)) ** 2
+                         ).sum(-1))
+        T_arr = d_euc + gate * (T_arr - d_euc)
+
+    return T_arr
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ SAM_VERSION: 'vit_b'
 SAM_CKPT_PATH: '../sam_road_repo/sam_ckpts/sam_vit_b_01ec64.pth'
 
 # Phase 1 best checkpoint as starting point (update after Phase 1 r=5 training)
-PRETRAINED_CKPT: '../training_outputs/phase1_seg/checkpoints/last.ckpt'
+PRETRAINED_CKPT: 'training_outputs/phase1_r5_seg/checkpoints/samroute-epoch=57-val_seg_loss=0.6815.ckpt'
 
 # ---- Input ----
 PATCH_SIZE: 512
@@ -43,14 +43,16 @@ ROAD_DICE_WEIGHT: 0.5
 ROAD_DUAL_TARGET: True
 
 # ---- Eikonal solver (distance supervision) ----
-ROUTE_EIK_ITERS: 20
+# ds and n_iters are now DECOUPLED. ds=8 is fixed; n_iters controls convergence only.
+# Ablation showed: ds=8 (Pc~94) converges at n_iters~40, giving Sp~0.756 on GT masks.
+ROUTE_EIK_ITERS: 40
 ROUTE_CKPT_CHUNK: 5
 ROUTE_ROI_MARGIN: 64
-ROUTE_EIK_DOWNSAMPLE: 8
+ROUTE_EIK_DOWNSAMPLE: 8            # fixed grid resolution (decoupled from n_iters)
 ROUTE_K_TARGETS: 4
 ROUTE_MIN_IN_PATCH: 2
 
-# GPPN-inspired stabilisation
+# Stabilisation
 ROUTE_DIST_WARMUP_STEPS: 300
 ROUTE_EIK_WARMUP_EPOCHS: 3
 ROUTE_EIK_ITERS_MIN: 10

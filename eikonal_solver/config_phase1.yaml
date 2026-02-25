@@ -1,13 +1,18 @@
-# SAMRoute training demo config — Phase 1: road segmentation only
-# Phase 2 (distance supervision) can be enabled by setting ROUTE_LAMBDA_DIST > 0
-# and passing include_dist=True to the dataset builder.
+# SAMRoute config — Phase 1: road segmentation only
+#
+# Train road segmentation decoder from a pretrained SAMRoad checkpoint.
+# Encoder is frozen; only the lightweight map_decoder is updated.
+# Dual-target training: BCE on thick mask (recall) + Dice on thin mask (precision).
+#
+# Usage:
+#   bash eikonal_solver/run_train.sh --phase 1 --epochs 200
 
 # ---- SAM backbone ----
 NO_SAM: False
 SAM_VERSION: 'vit_b'
 SAM_CKPT_PATH: '../sam_road_repo/sam_ckpts/sam_vit_b_01ec64.pth'
 
-# Optional: fine-tune from an existing SAMRoad checkpoint (comment out to train from scratch)
+# Fine-tune from an existing SAMRoad checkpoint
 PRETRAINED_CKPT: '../checkpoints/cityscale_vitb_512_e10.ckpt'
 
 # ---- Input ----
@@ -18,54 +23,41 @@ BATCH_SIZE: 4
 DATA_WORKER_NUM: 24
 TRAIN_EPOCHS: 10
 BASE_LR: 0.0003
-FREEZE_ENCODER: True        # freeze SAM image encoder; only train the map decoder
+FREEZE_ENCODER: True
 ENCODER_LR_FACTOR: 0.1
 ENCODER_LORA: False
 FOCAL_LOSS: False
 USE_SAM_DECODER: False
 
-# ---- SAMRoute-specific ----
-# Phase 1: seg only — set ROUTE_LAMBDA_DIST: 0.0
-# Phase 2: enable distance loss — set ROUTE_LAMBDA_DIST: 1.0
+# ---- Loss ----
 ROUTE_LAMBDA_SEG: 1.0
-ROUTE_LAMBDA_DIST: 0.0
+ROUTE_LAMBDA_DIST: 0.0          # Phase 1: seg only (no distance loss)
 
-# LR schedule: MultiStepLR milestones (epoch indices). Original SAMRoad used [9]
-# which decays too early.  [150] keeps full LR for most of 200-epoch training.
 LR_MILESTONES: [150]
 
-# Class imbalance compensation for road segmentation loss.
-# Road pixels are ~6-7% of each patch; without this, BCEWithLogitsLoss drives the
-# model to predict all-background, collapsing IoU to ~0.03 in epoch 1.
-# pos_weight ≈ (1 - road_density) / road_density
-#   Original masks (~6.7% road): pos_weight ≈ 13.9
-#   Normalized masks r=3 (~8.3% road): pos_weight ≈ 11.0  ← use this when --road_dilation_radius 3
-# Set to 1.0 to disable (original behavior, not recommended).
-ROAD_POS_WEIGHT: 3.7   # ~21% road density with dilation r=5 (use 13.9 for r=0)
+# Class imbalance: pos_weight ≈ (1 - road_density) / road_density
+ROAD_POS_WEIGHT: 3.7            # ~21% road density with dilation r=5
 
-# Dice loss weight (0.0 = pure BCE, 0.5 = equal mix, 1.0 = pure Dice).
-# Dice directly optimises IoU overlap; prevents the "confidence calibration plateau"
-# where BCE loss keeps dropping but binary IoU stays flat.
+# Dice loss weight (0.0 = pure BCE, 0.5 = equal mix, 1.0 = pure Dice)
 ROAD_DICE_WEIGHT: 0.5
 
-# Cost function mode for Eikonal ("exp" | "add")
+# Dual-target: BCE against thick mask (recall), Dice against thin mask (precision).
+# Produces sharp road boundaries ideal for Eikonal cost landscapes.
+ROAD_DUAL_TARGET: True
+
+# ---- Eikonal evaluation parameters (used by SpearmanEvalCallback) ----
+# ds and n_iters are DECOUPLED: ds=8 fixed, n_iters controls convergence.
+# Ablation: ds=8, n_iters=40, gate=0.8 → Sp~0.756 on GT masks.
+ROUTE_EIK_ITERS: 40
+ROUTE_EIK_DOWNSAMPLE: 8
+ROUTE_EIK_GATE_INIT: 0.80
+
+# Cost function for Eikonal
 ROUTE_COST_MODE: 'add'
 ROUTE_ADD_ALPHA: 20.0
 ROUTE_ADD_GAMMA: 2.0
 ROUTE_ADD_BLOCK_ALPHA: 50.0
 ROUTE_ADD_BLOCK_SMOOTH: 50.0
-
-# ---- Inference thresholds (kept for compatibility) ----
-ITSC_THRESHOLD: 0.248
-ROAD_THRESHOLD: 0.364
-TOPO_THRESHOLD: 0.500
-ITSC_NMS_RADIUS: 8
-ROAD_NMS_RADIUS: 16
-NEIGHBOR_RADIUS: 64
-MAX_NEIGHBOR_QUERIES: 16
-INFER_BATCH_SIZE: 64
-SAMPLE_MARGIN: 64
-INFER_PATCHES_PER_EDGE: 8
 
 # ---- Unused by SAMRoute but required by SAMRoad parent __init__ ----
 TOPO_SAMPLE_NUM: 512

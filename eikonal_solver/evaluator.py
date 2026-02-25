@@ -404,7 +404,7 @@ class SAMRouteEvaluator:
             sr_y = max(0, min(int(src[0]) - y0, P - 1))
             sr_x = max(0, min(int(src[1]) - x0, P - 1))
 
-            ds = max(min_ds, math.ceil(P / max(n_iters, 1)))
+            ds = min_ds
             if ds > 1:
                 P_pad = math.ceil(P / ds) * ds
                 if P_pad > P:
@@ -438,7 +438,18 @@ class SAMRouteEvaluator:
                     tr_y = max(0, min(int(tgts[ki, 0]) - y0, P - 1))
                     tr_x = max(0, min(int(tgts[ki, 1]) - x0, P - 1))
                     vals.append(float(T[tr_y, tr_x].item()))
-            return np.array(vals, dtype=np.float64)
+            T_arr = np.array(vals, dtype=np.float64)
+
+            # Euclidean residual blending (consistent with model._mix_eikonal_euclid)
+            if hasattr(self.model, 'eik_gate_logit'):
+                gate_logit = float(self.model.eik_gate_logit.detach().cpu().item())
+                gate = min(0.95, max(0.3, 1.0 / (1.0 + math.exp(-gate_logit))))
+                d_euc = np.sqrt(((src.cpu().numpy().astype(np.float64)
+                                  - tgts.cpu().numpy().astype(np.float64)) ** 2
+                                 ).sum(-1))
+                T_arr = d_euc + gate * (T_arr - d_euc)
+
+            return T_arr
 
         sp_acc, kd_acc, pw_acc = [], [], []
         t0 = time.time()

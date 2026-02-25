@@ -867,19 +867,23 @@ class ThreadedLoader:
         finished = threading.Semaphore(0)
 
         def _worker():
-            while True:
-                batch_idx = idx_q.get()
-                if batch_idx is None:
-                    finished.release()
-                    return
-                items = [self.dataset[i] for i in batch_idx]
-                collated = self._collate(items)
-                if self.pin_memory:
-                    collated = {
-                        k: v.pin_memory() if torch.is_tensor(v) else v
-                        for k, v in collated.items()
-                    }
-                out_q.put(collated)
+            try:
+                while True:
+                    batch_idx = idx_q.get()
+                    if batch_idx is None:
+                        finished.release()
+                        return
+                    items = [self.dataset[i] for i in batch_idx]
+                    collated = self._collate(items)
+                    if self.pin_memory:
+                        collated = {
+                            k: v.pin_memory() if torch.is_tensor(v) else v
+                            for k, v in collated.items()
+                        }
+                    out_q.put(collated)
+            except Exception as e:
+                out_q.put(e)
+                finished.release()
 
         workers = [
             threading.Thread(target=_worker, daemon=True)
@@ -892,10 +896,19 @@ class ThreadedLoader:
         while yielded < len(batch_list):
             try:
                 item = out_q.get(timeout=60)
+                if isinstance(item, Exception):
+                    raise RuntimeError(
+                        f"ThreadedLoader worker crashed: {item}"
+                    ) from item
                 yield item
                 yielded += 1
             except queue.Empty:
-                pass
+                alive = any(w.is_alive() for w in workers)
+                if not alive:
+                    raise RuntimeError(
+                        "All ThreadedLoader workers exited but "
+                        f"only {yielded}/{len(batch_list)} batches yielded"
+                    )
 
         for w in workers:
             w.join()

@@ -37,3 +37,4 @@ Thumbs.db
 *.bin
 *.safetensors
 eval_vis
+images
