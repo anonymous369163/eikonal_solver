@@ -31,6 +31,22 @@ def softmin_algebraic(x: torch.Tensor, y: torch.Tensor, tau: float) -> torch.Ten
     return 0.5 * (x + y - torch.sqrt(dist * dist + smooth_factor + 1e-8))
 
 
+def _ste(hard: torch.Tensor, soft: torch.Tensor) -> torch.Tensor:
+    """Straight-Through Estimator: forward=hard, backward=soft."""
+    return hard + (soft - soft.detach())
+
+
+def _min2(x: torch.Tensor, y: torch.Tensor, tau: float, mode: str) -> torch.Tensor:
+    """Binary min: hard / soft / ste by mode."""
+    if mode == "soft_train":
+        return softmin_algebraic(x, y, tau)
+    hard = torch.minimum(x, y)
+    if mode == "ste_train":
+        soft = softmin_algebraic(x, y, tau)
+        return _ste(hard, soft)
+    return hard
+
+
 def prob_to_cost(
     prob: torch.Tensor,
     gamma: float = 3.0,
@@ -103,17 +119,20 @@ class EikonalConfig:
     h: float = 1.0
     tau_min: float = 0.1
     tau_branch: float = 0.1
-    tau_update: float = 0.1
+    tau_update: float = 0.01  # soft monotone 时更接近 hard min，误差更小
     large_val: float = 1e6
     eps: float = 1e-6
     use_redblack: bool = True
     monotone: bool = True
+    mode: Optional[str] = None  # "hard_eval" | "ste_train" | "soft_train"
+    monotone_hard: bool = False  # deprecated: use mode; compat: monotone_hard=True -> hard_eval
 
 
 def _local_update_fast(
     T: torch.Tensor, cost: torch.Tensor,
     h: float, large_val: float,
     tau_min: float, tau_branch: float,
+    mode: str,
 ) -> torch.Tensor:
     """One Eikonal update step using pad+slice (2-4x faster than torch.roll)."""
     Tpad = F.pad(T, (1, 1, 1, 1), value=large_val)
@@ -122,17 +141,40 @@ def _local_update_fast(
     T_u = Tpad[:, 0:-2, 1:-1]
     T_d = Tpad[:, 2:, 1:-1]
 
-    a = softmin_algebraic(T_l, T_r, tau_min)
-    b = softmin_algebraic(T_u, T_d, tau_min)
+    a = _min2(T_l, T_r, tau_min, mode)
+    b = _min2(T_u, T_d, tau_min, mode)
 
     hc = cost * h
     d = torch.abs(a - b)
     s = torch.sigmoid((d - hc) / max(float(tau_branch), 1e-6))
-    m = softmin_algebraic(a, b, tau_min)
+    m = _min2(a, b, tau_min, mode)
+
     t1 = m + hc
     rad = torch.clamp(2.0 * hc * hc - d * d, min=0.0)
     t2 = 0.5 * (a + b + torch.sqrt(rad + 1e-8))
-    return s * t1 + (1.0 - s) * t2
+
+    if mode == "soft_train":
+        return s * t1 + (1.0 - s) * t2
+    hard_sel = torch.where(d >= hc, t1, t2)
+    if mode == "ste_train":
+        soft_sel = s * t1 + (1.0 - s) * t2
+        return _ste(hard_sel, soft_sel)
+    return hard_sel
+
+
+def _monotone_update(
+    T: torch.Tensor, T_new: torch.Tensor,
+    tau_update: float, mode: str, monotone: bool,
+) -> torch.Tensor:
+    if not monotone:
+        return T_new
+    if mode == "soft_train":
+        return softmin_algebraic(T, T_new, tau_update)
+    hard = torch.minimum(T, T_new)
+    if mode == "ste_train":
+        soft = softmin_algebraic(T, T_new, tau_update)
+        return _ste(hard, soft)
+    return hard
 
 
 def eikonal_soft_sweeping(
@@ -182,6 +224,9 @@ def eikonal_soft_sweeping(
     tau_min = float(cfg.tau_min)
     tau_branch = float(cfg.tau_branch)
     tau_update = float(cfg.tau_update)
+    mode = getattr(cfg, 'mode', None)
+    if mode is None:
+        mode = "hard_eval" if getattr(cfg, 'monotone_hard', False) else "ste_train"
 
     if cfg.use_redblack:
         yy = torch.arange(H, device=device)[:, None]
@@ -193,8 +238,8 @@ def eikonal_soft_sweeping(
 
     for _ in range(int(cfg.n_iters)):
         if cfg.use_redblack:
-            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
-            T_e = softmin_algebraic(T, T_new, tau_update) if cfg.monotone else T_new
+            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch, mode)
+            T_e = _monotone_update(T, T_new, tau_update, mode, cfg.monotone)
             if return_convergence:
                 # Even half-step: delta on even cells (T only decreases → T - T_e >= 0)
                 delta_e = (T - T_e).clamp_min(0.0)
@@ -205,8 +250,8 @@ def eikonal_soft_sweeping(
             else:
                 T = torch.where(source_mask, torch.zeros_like(T), T)
 
-            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
-            T_o = softmin_algebraic(T, T_new, tau_update) if cfg.monotone else T_new
+            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch, mode)
+            T_o = _monotone_update(T, T_new, tau_update, mode, cfg.monotone)
             if return_convergence:
                 # Odd half-step delta
                 delta_o = (T - T_o).clamp_min(0.0)
@@ -223,8 +268,8 @@ def eikonal_soft_sweeping(
             else:
                 T = torch.where(source_mask, torch.zeros_like(T), T)
         else:
-            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
-            T_upd = softmin_algebraic(T, T_new, tau_update) if cfg.monotone else T_new
+            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch, mode)
+            T_upd = _monotone_update(T, T_new, tau_update, mode, cfg.monotone)
             if return_convergence:
                 delta = (T - T_upd).clamp_min(0.0)
                 delta_finite = delta[T < large_val * 0.9]

@@ -303,7 +303,33 @@ class SAMRoad(pl.LightningModule):
                 nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
                 activation(),
                 nn.ConvTranspose2d(32, 2, kernel_size=2, stride=2),
-            )
+            ) 
+            
+            #### 极简平滑版 Decoder (保留原版强大的细线保留能力，仅在末端平滑)
+            # activation = nn.GELU
+            # self.map_decoder = nn.Sequential(
+            #     # Stage 1 (完全保持原版)
+            #     nn.ConvTranspose2d(encoder_output_dim, 128, kernel_size=2, stride=2),
+            #     LayerNorm2d(128),
+            #     activation(),
+                
+            #     # Stage 2 (完全保持原版，无 Norm)
+            #     nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+            #     activation(),
+                
+            #     # Stage 3 (完全保持原版，无 Norm)
+            #     nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+            #     activation(),
+                
+            #     # Stage 4 (原版最后直接输出 2 通道，这里我们先放大，再平滑)
+            #     # 依然使用无重叠转置卷积保持信号强度，但输出 32 通道
+            #     nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2),
+            #     activation(),
+                
+            #     # 🚀 唯一加的一层：末端抗马赛克滤镜！
+            #     # 在这层 3x3 卷积中，融合 512x512 的相邻像素，彻底消除块状感
+            #     nn.Conv2d(32, 2, kernel_size=3, padding=1)
+            # )
 
         
         #### TOPONet
@@ -692,7 +718,7 @@ import math as _math
 from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 from eikonal import (
     EikonalConfig, prob_to_cost, make_source_mask, eikonal_soft_sweeping,
-    _local_update_fast, softmin_algebraic,
+    _local_update_fast, _monotone_update, softmin_algebraic,
 )
 
 
@@ -825,6 +851,7 @@ def _eikonal_iter_chunk(
     tau_update: float,
     use_redblack: bool,
     monotone: bool,
+    mode: str,
     n_chunk: int,
     gate_alpha: float = 1.0,
 ) -> torch.Tensor:
@@ -841,24 +868,24 @@ def _eikonal_iter_chunk(
     for _ in range(n_chunk):
         if use_redblack:
             T_old = T
-            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
-            T_e = softmin_algebraic(T, T_new, tau_update) if monotone else T_new
+            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch, mode)
+            T_e = _monotone_update(T, T_new, tau_update, mode, monotone)
             if use_gate:
                 T_e = gate_alpha * T_e + (1.0 - gate_alpha) * T_old
             T = torch.where(even_mask, T_e, T)
             T = torch.where(src_mask, torch.zeros_like(T), T)
 
             T_old = T
-            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
-            T_o = softmin_algebraic(T, T_new, tau_update) if monotone else T_new
+            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch, mode)
+            T_o = _monotone_update(T, T_new, tau_update, mode, monotone)
             if use_gate:
                 T_o = gate_alpha * T_o + (1.0 - gate_alpha) * T_old
             T = torch.where(odd_mask, T_o, T)
             T = torch.where(src_mask, torch.zeros_like(T), T)
         else:
             T_old = T
-            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch)
-            T = softmin_algebraic(T, T_new, tau_update) if monotone else T_new
+            T_new = _local_update_fast(T, cost, h_val, large_val, tau_min, tau_branch, mode)
+            T = _monotone_update(T, T_new, tau_update, mode, monotone)
             if use_gate:
                 T = gate_alpha * T + (1.0 - gate_alpha) * T_old
             T = torch.where(src_mask, torch.zeros_like(T), T)
@@ -912,6 +939,9 @@ def _eikonal_soft_sweeping_diff(
     tau_update = float(cfg.tau_update)
     use_redblack = bool(cfg.use_redblack)
     monotone     = bool(cfg.monotone)
+    mode = getattr(cfg, 'mode', None)
+    if mode is None:
+        mode = "hard_eval" if getattr(cfg, 'monotone_hard', False) else "ste_train"
     ga           = float(gate_alpha)
 
     if use_redblack:
@@ -932,7 +962,7 @@ def _eikonal_soft_sweeping_diff(
             return _eikonal_iter_chunk(
                 T_in, cost_in, src_m, even_m, odd_m,
                 h_val, large_val, tau_min, tau_branch, tau_update,
-                use_redblack, monotone, nc, ga,
+                use_redblack, monotone, mode, nc, ga,
             )
         return fn
 
@@ -1027,6 +1057,7 @@ class SAMRoute(SAMRoad):
             tau_update  = 0.03,
             use_redblack= True,
             monotone    = True,
+            mode       = "ste_train",
         )
         self.route_ckpt_chunk   = int(_cfg(config,   "ROUTE_CKPT_CHUNK",   10))
         self.route_roi_margin   = int(_cfg(config,   "ROUTE_ROI_MARGIN",   64))
@@ -1059,6 +1090,8 @@ class SAMRoute(SAMRoad):
         # Dual-target: BCE against thick mask, Dice against original thin mask.
         # This gives the model wide-road recall (BCE) + sharp boundaries (Dice).
         self._road_dual_target  = bool(_cfg(config, "ROAD_DUAL_TARGET", False))
+        # Extra BCE weight for thin-road pixels when dual_target. Higher = more emphasis on fine roads.
+        self._road_thin_boost   = float(_cfg(config, "ROAD_THIN_BOOST", 5.0))
         self.road_criterion = torch.nn.BCEWithLogitsLoss()  # pos_weight applied dynamically in _seg_forward
         self.dist_criterion = torch.nn.HuberLoss(delta=2.0)
 
@@ -1360,16 +1393,27 @@ class SAMRoute(SAMRoad):
         road_logits = mask_logits[..., 1]   # [B, H, W]
         road_prob   = mask_scores[..., 1]   # [B, H, W]
 
-        # --- BCE loss against THICK mask (class imbalance compensation) ---
-        # Thick GT (r=8) matches the 16px feature stride so the encoder can
-        # reliably encode road locations.
-        if self._road_pos_weight != 1.0:
-            pw = torch.tensor(self._road_pos_weight, device=road_logits.device,
-                              dtype=road_logits.dtype)
-            loss_bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                road_logits, road_mask, pos_weight=pw)
-        else:
-            loss_bce = self.road_criterion(road_logits, road_mask)
+        # --- Robust normalized spatial weighted BCE loss ---
+        # 1. Per-pixel BCE (no reduction)
+        bce_raw = torch.nn.functional.binary_cross_entropy_with_logits(
+            road_logits, road_mask, reduction='none'
+        )
+
+        # 2. Base weight map (background = 1.0)
+        w = torch.ones_like(road_mask, dtype=road_logits.dtype)
+        pos_w = self._road_pos_weight
+
+        # 3. Thick road positives: weight = pos_w
+        w = w + (pos_w - 1.0) * (road_mask > 0.5).to(w.dtype)
+
+        # 4. If dual_target, extra boost for thin skeleton (thin_boost x thick weight)
+        if self._road_dual_target and "road_mask_thin" in batch:
+            thin = batch["road_mask_thin"].to(w.device)
+            thin_boost = self._road_thin_boost
+            w = w + (pos_w * thin_boost - 1.0) * (thin > 0.5).to(w.dtype)
+
+        # 5. Normalize by weight sum (stable loss scale across batches)
+        loss_bce = (bce_raw * w).sum() / (w.sum() + 1e-6)
 
         # --- Dice loss ---
         # When dual_target is enabled, Dice is computed against the THIN
