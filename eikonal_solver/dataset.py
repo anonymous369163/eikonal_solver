@@ -190,7 +190,7 @@ class MMRouteDataset(Dataset):
             # Prefer pre-computed normalized mask when road_dilation_radius > 0
             r = self.road_dilation_radius
             orig_png = sorted(glob.glob(os.path.join(region_path, "roadnet_*.png")))
-            orig_png = [p for p in orig_png if "normalized" not in p]
+            orig_png = [p for p in orig_png if "normalized" not in p and "skeleton" not in p]
             orig_png_path = orig_png[0] if orig_png else None
             norm_path = os.path.join(region_path, f"roadnet_normalized_r{r}.png") if r > 0 else None
             if norm_path and os.path.exists(norm_path):
@@ -208,10 +208,18 @@ class MMRouteDataset(Dataset):
             has_feat = bool(feat_paths) and use_cached_features
             if has_feat:
                 n_with_feat += 1
-            # When dual_target is active, store original thin mask path separately.
-            # png_thin is set only when road_dilation_radius > 0 AND the
-            # original (non-normalized) mask differs from the thick mask.
-            png_thin = orig_png_path if (r > 0 and png_path != orig_png_path) else None
+            # Thin mask for dual-target (BCE thin_boost + Dice). Prefer skeleton
+            # (length-proportional) over original (area-biased toward main roads).
+            skeleton_paths = sorted(
+                glob.glob(os.path.join(region_path, "roadnet_skeleton*.png"))
+            )
+            best_skeleton_path = skeleton_paths[0] if skeleton_paths else None
+            if best_skeleton_path is not None:
+                png_thin = best_skeleton_path
+            elif r > 0 and png_path != orig_png_path:
+                png_thin = orig_png_path
+            else:
+                png_thin = None
             self._meta.append({
                 "tif":  tif_path,
                 "png":  png_path,
@@ -420,11 +428,29 @@ class MMRouteDataset(Dataset):
                 y0 = max(0, min(anchor_py - ps // 2, max_y))
                 x0 = max(0, min(anchor_px - ps // 2, max_x))
             else:
-                y0 = random.randint(0, max_y)
-                x0 = random.randint(0, max_x)
+                y0 = torch.randint(0, max_y + 1, (1,)).item() if max_y > 0 else 0
+                x0 = torch.randint(0, max_x + 1, (1,)).item() if max_x > 0 else 0
         else:
-            y0 = random.randint(0, max_y)
-            x0 = random.randint(0, max_x)
+            y0 = torch.randint(0, max_y + 1, (1,)).item() if max_y > 0 else 0
+            x0 = torch.randint(0, max_x + 1, (1,)).item() if max_x > 0 else 0
+
+        # When using pre-computed encoder features (has_feat=True), the feature
+        # map is stored at stride-16 resolution: feature token (fy, fx) covers
+        # exactly image pixels [fy*16 : (fy+1)*16, fx*16 : (fx+1)*16].
+        # If y0 is NOT a multiple of 16, fy0 = y0 // 16 maps to a token that
+        # starts at fy0*16, which differs from y0 by up to 15 pixels.  This
+        # spatial misalignment between the feature crop and the mask crop
+        # introduces a random 0–15 px offset into every training sample,
+        # making the decoder learn inconsistent boundary positions and
+        # contributing to 16-px checkerboard artifacts.
+        # Fix: snap y0/x0 to the nearest lower multiple of 16 when has_feat=True.
+        if has_feat:
+            y0 = (y0 // 16) * 16
+            x0 = (x0 // 16) * 16
+            # Re-clamp after snapping (snapping down can never exceed max, but
+            # snapping an anchor-derived value might create edge cases).
+            y0 = max(0, min(y0, max_y))
+            x0 = max(0, min(x0, max_x))
 
         y1 = min(y0 + ps, H_full)
         x1 = min(x0 + ps, W_full)
@@ -457,8 +483,8 @@ class MMRouteDataset(Dataset):
         mask_thin_t = torch.from_numpy(mask_thin_patch) if mask_thin_patch is not None else None
         rgb_t  = torch.from_numpy(rgb_patch.astype(np.float32)) if rgb_patch is not None else None
 
-        flip_h = self.augment and (random.random() > 0.5)
-        flip_v = self.augment and (random.random() > 0.5)
+        flip_h = self.augment and (torch.rand(1).item() > 0.5)
+        flip_v = self.augment and (torch.rand(1).item() > 0.5)
         if flip_h:
             mask_t = mask_t.flip(-1)            # flip W in [H, W]
             if mask_thin_t is not None:
@@ -471,6 +497,19 @@ class MMRouteDataset(Dataset):
                 mask_thin_t = mask_thin_t.flip(-2)
             if rgb_t is not None:
                 rgb_t = rgb_t.flip(0)            # flip H in [H, W, 3]
+
+        # Color jitter (training only, only when RGB is available).
+        # Applies random brightness and contrast perturbations to improve
+        # generalisation across different lighting conditions and reduce
+        # over-sensitivity to specific colour patterns that can manifest
+        # as blocky artifacts.
+        if self.augment and rgb_t is not None:
+            # Work in [0, 1] to keep arithmetic stable, then rescale back.
+            rgb_f = rgb_t / 255.0
+            brightness = random.uniform(0.8, 1.2)
+            contrast_shift = random.uniform(-0.10, 0.10)
+            rgb_f = (rgb_f * brightness + contrast_shift).clamp(0.0, 1.0)
+            rgb_t = rgb_f * 255.0
 
         sample: Dict[str, Any] = {"road_mask": mask_t}
         if mask_thin_t is not None:
@@ -556,9 +595,10 @@ class MMRouteDataset(Dataset):
         ps         = self.patch_size
         min_nb     = self.min_in_patch
 
-        # Pre-compute all node pixel coords for quick in-patch counting
-        all_px = np.round(xy_norm[:, 0] * W_full).astype(int)
-        all_py = np.round((1.0 - xy_norm[:, 1]) * H_full).astype(int)
+        # Pre-compute all node pixel coords for quick in-patch counting.
+        # Use (W_full - 1) / (H_full - 1) to match load_nodes_from_npz convention.
+        all_px = np.round(xy_norm[:, 0] * (W_full - 1)).astype(int)
+        all_py = np.round((1.0 - xy_norm[:, 1]) * (H_full - 1)).astype(int)
 
         MAX_TRIES = max(N * 3, 30)
         candidates = list(range(N))
@@ -620,8 +660,8 @@ class MMRouteDataset(Dataset):
         n_cases, N, _ = coords.shape
         xy_norm = coords[case_idx]               # (N, 2)
 
-        px_x = xy_norm[:, 0] * W_full
-        px_y = (1.0 - xy_norm[:, 1]) * H_full
+        px_x = xy_norm[:, 0] * (W_full - 1)
+        px_y = (1.0 - xy_norm[:, 1]) * (H_full - 1)
         px   = np.stack([px_x, px_y], axis=1)   # (N, 2)  (x, y) top-left pixel
 
         # Anchor in patch-relative coords
@@ -725,8 +765,8 @@ class MMRouteDataset(Dataset):
         xy_norm = coords[case_idx]  # (N, 2)  (x, y) bottom-left
 
         # Convert to pixel coords in the full image
-        px_x = xy_norm[:, 0] * W_full
-        px_y = (1.0 - xy_norm[:, 1]) * H_full
+        px_x = xy_norm[:, 0] * (W_full - 1)
+        px_y = (1.0 - xy_norm[:, 1]) * (H_full - 1)
         px   = np.stack([px_x, px_y], axis=1)  # (N, 2)  (x, y) top-left pixel
 
         # Find nodes inside crop window

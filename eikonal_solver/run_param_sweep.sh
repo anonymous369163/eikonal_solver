@@ -30,12 +30,13 @@ if [[ -n "${GPU_ID}" ]]; then
 fi
 
 # 单轮默认参数（跑一轮即可）
-ROAD_POS_WEIGHT=15.0
+# pos_weight 建议范围 5~10；15 会把模型推向"全图是路"的平凡解
+ROAD_POS_WEIGHT=8.0
 ROAD_DICE_WEIGHT=0.5
-ROAD_THIN_BOOST=6.0
+ROAD_THIN_BOOST=4.0
 
 # LoRA 模式：设为 1 启用 LoRA encoder 微调，0 则只训练 Decoder
-ENCODER_LORA_MODE=0
+ENCODER_LORA_MODE=1
 LORA_RANK=4
 # LoRA 时 batch 较小（需在线跑 Encoder），非 LoRA 可用较大 batch
 BATCH_SIZE=32
@@ -76,6 +77,7 @@ python eikonal_solver/finetune_demo.py \
   --road_pos_weight "${ROAD_POS_WEIGHT}" \
   --road_dice_weight "${ROAD_DICE_WEIGHT}" \
   --road_thin_boost "${ROAD_THIN_BOOST}" \
+  --smooth_decoder \
   --run_name "${RUN_NAME}" \
   ${LORA_FLAG}
 

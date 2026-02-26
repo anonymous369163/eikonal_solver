@@ -292,44 +292,39 @@ class SAMRoad(pl.LightningModule):
                 iou_head_hidden_dim=256,
             )
         else:
-            #### Naive decoder
             activation = nn.GELU
-            self.map_decoder = nn.Sequential(
-                nn.ConvTranspose2d(encoder_output_dim, 128, kernel_size=2, stride=2),
-                LayerNorm2d(128),
-                activation(),
-                nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
-                activation(),
-                nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
-                activation(),
-                nn.ConvTranspose2d(32, 2, kernel_size=2, stride=2),
-            ) 
-            
-            #### 极简平滑版 Decoder (保留原版强大的细线保留能力，仅在末端平滑)
-            # activation = nn.GELU
-            # self.map_decoder = nn.Sequential(
-            #     # Stage 1 (完全保持原版)
-            #     nn.ConvTranspose2d(encoder_output_dim, 128, kernel_size=2, stride=2),
-            #     LayerNorm2d(128),
-            #     activation(),
-                
-            #     # Stage 2 (完全保持原版，无 Norm)
-            #     nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
-            #     activation(),
-                
-            #     # Stage 3 (完全保持原版，无 Norm)
-            #     nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
-            #     activation(),
-                
-            #     # Stage 4 (原版最后直接输出 2 通道，这里我们先放大，再平滑)
-            #     # 依然使用无重叠转置卷积保持信号强度，但输出 32 通道
-            #     nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2),
-            #     activation(),
-                
-            #     # 🚀 唯一加的一层：末端抗马赛克滤镜！
-            #     # 在这层 3x3 卷积中，融合 512x512 的相邻像素，彻底消除块状感
-            #     nn.Conv2d(32, 2, kernel_size=3, padding=1)
-            # )
+            use_smooth = getattr(self.config, 'USE_SMOOTH_DECODER', False)
+            if use_smooth:
+                # Smooth decoder: identical first 3 upsampling stages, then
+                # ConvTranspose2d(32→32) followed by a 3×3 Conv2d(32→2).
+                # The final Conv2d aggregates a 3×3 neighbourhood at full
+                # resolution, bridging the 16-px ViT token-grid boundaries
+                # and eliminating the checkerboard pattern.
+                self.map_decoder = nn.Sequential(
+                    nn.ConvTranspose2d(encoder_output_dim, 128, kernel_size=2, stride=2),
+                    LayerNorm2d(128),
+                    activation(),
+                    nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+                    activation(),
+                    nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+                    activation(),
+                    nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2),
+                    activation(),
+                    nn.Conv2d(32, 2, kernel_size=3, padding=1),
+                )
+            else:
+                # Standard decoder: 4× ConvTranspose2d, backward-compatible
+                # with all existing checkpoints.
+                self.map_decoder = nn.Sequential(
+                    nn.ConvTranspose2d(encoder_output_dim, 128, kernel_size=2, stride=2),
+                    LayerNorm2d(128),
+                    activation(),
+                    nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+                    activation(),
+                    nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+                    activation(),
+                    nn.ConvTranspose2d(32, 2, kernel_size=2, stride=2),
+                )
 
         
         #### TOPONet
@@ -947,8 +942,8 @@ def _eikonal_soft_sweeping_diff(
     if use_redblack:
         yy = torch.arange(H, device=device)[:, None]
         xx = torch.arange(W, device=device)[None, :]
-        even_mask = ((yy + xx) % 2 == 0)[None, :, :].expand(B, -1, -1).contiguous()
-        odd_mask  = (~((yy + xx) % 2 == 0))[None, :, :].expand(B, -1, -1).contiguous()
+        even_mask = ((yy + xx) % 2 == 0)[None, :, :]   # [1, H, W]; broadcast over B
+        odd_mask  = ~even_mask
     else:
         dummy = torch.zeros(1, 1, 1, dtype=torch.bool, device=device)
         even_mask = dummy
@@ -1247,7 +1242,7 @@ class SAMRoute(SAMRoad):
                     patch.unsqueeze(0).unsqueeze(0), kernel_size=ds, stride=ds
                 ).squeeze(0).squeeze(0)  # [P_c, P_c]
 
-                cost_coarse = self._road_prob_to_cost(patch_coarse)
+                cost_coarse = self._road_prob_to_cost(patch_coarse).to(dtype=torch.float32)
                 P_c = cost_coarse.shape[0]
 
                 src_c_y = max(0, min(src_rel_y // ds, P_c - 1))
@@ -1271,7 +1266,7 @@ class SAMRoute(SAMRoad):
 
                 dists.append(T_b[0, tgt_c_y, tgt_c_x])
             else:
-                cost_patch = self._road_prob_to_cost(patch)
+                cost_patch = self._road_prob_to_cost(patch).to(dtype=torch.float32)
 
                 src_mask_b = torch.zeros(1, P, P, dtype=torch.bool, device=device)
                 src_mask_b[0, src_rel_y, src_rel_x] = True
@@ -1770,7 +1765,7 @@ class SAMRoute(SAMRoad):
             if ph < P_c or pw < P_c:
                 patch_c = F.pad(patch_c, (0, P_c - pw, 0, P_c - ph), value=0.0)
 
-            costs_list.append(self._road_prob_to_cost(patch_c))  # [P_c, P_c]
+            costs_list.append(self._road_prob_to_cost(patch_c).to(dtype=torch.float32))  # [P_c, P_c]
 
             sc_y = max(0, min(sr_y // ds_common, P_c - 1))
             sc_x = max(0, min(sr_x // ds_common, P_c - 1))

@@ -15,6 +15,7 @@ Usage:
     cd /home/yuepeng/code/mmdm_V3/MMDataset
     python eikonal_solver/precompute_normalized_masks.py
     python eikonal_solver/precompute_normalized_masks.py --radius 3 --workers 16
+    python eikonal_solver/precompute_normalized_masks.py --radius 3 --thin_radius 1   # + thin 3px
     python eikonal_solver/precompute_normalized_masks.py --dry_run   # count regions only
 """
 
@@ -73,26 +74,58 @@ def normalize_road_mask(mask_float: np.ndarray, radius: int) -> np.ndarray:
     return dilated.astype(np.float32)
 
 
-def process_region(region_path: str, radius: int, overwrite: bool) -> str:
-    """Process one region and save the normalized mask. Returns status string."""
+def skeleton_road_mask(mask_float: np.ndarray, thin_radius: int) -> np.ndarray:
+    """
+    Convert a float [0,1] road mask to a skeleton-based thin mask.
+    All roads get uniform pixel density (length-proportional), helping
+    thin side streets receive equal loss weight as main roads.
+
+    Steps:
+      1. Binarize at 0.5
+      2. Skeletonize → 1-pixel centrelines
+      3. If thin_radius > 0: dilate with disk(thin_radius) → (2*thin_radius+1) px
+
+    Returns float32 [H, W] in {0.0, 1.0}.
+    """
+    binary = mask_float > 0.5
+    if not binary.any():
+        return np.zeros_like(mask_float)
+    skel = skeletonize(binary)
+    if thin_radius == 0:
+        return skel.astype(np.float32)
+    dilated = binary_dilation(skel, disk(thin_radius))
+    return dilated.astype(np.float32)
+
+
+def process_region(
+    region_path: str, radius: int, thin_radius: int | None, overwrite: bool
+) -> str:
+    """Process one region and save the normalized (thick) and optional skeleton (thin) mask."""
     pngs = glob.glob(os.path.join(region_path, "roadnet_*.png"))
+    pngs = [p for p in pngs if "normalized" not in p and "skeleton" not in p]
     if not pngs:
-        return f"SKIP (no PNG): {region_path}"
+        return f"SKIP (no orig PNG): {region_path}"
 
     src_png = sorted(pngs)[0]
-    out_png = os.path.join(region_path, f"roadnet_normalized_r{radius}.png")
-
-    if os.path.exists(out_png) and not overwrite:
-        return f"EXISTS: {out_png}"
-
     arr = np.array(Image.open(src_png))[:, :, 0].astype(np.float32) / 255.0
-    normalized = normalize_road_mask(arr, radius)
 
-    # Save as RGBA PNG (R=G=B=road value * 255, A=255) matching original format
-    road_uint8 = (normalized * 255).astype(np.uint8)
-    rgba = np.stack([road_uint8, road_uint8, road_uint8,
-                     np.full_like(road_uint8, 255)], axis=-1)
-    Image.fromarray(rgba, mode="RGBA").save(out_png)
+    out_png = os.path.join(region_path, f"roadnet_normalized_r{radius}.png")
+    if not os.path.exists(out_png) or overwrite:
+        normalized = normalize_road_mask(arr, radius)
+        road_uint8 = (normalized * 255).astype(np.uint8)
+        rgba = np.stack([road_uint8, road_uint8, road_uint8,
+                         np.full_like(road_uint8, 255)], axis=-1)
+        Image.fromarray(rgba, mode="RGBA").save(out_png)
+
+    if thin_radius is not None:
+        out_thin = os.path.join(region_path, f"roadnet_skeleton_r{thin_radius}.png")
+        if not os.path.exists(out_thin) or overwrite:
+            thin_mask = skeleton_road_mask(arr, thin_radius)
+            thin_uint8 = (thin_mask * 255).astype(np.uint8)
+            rgba_thin = np.stack([thin_uint8, thin_uint8, thin_uint8,
+                                  np.full_like(thin_uint8, 255)], axis=-1)
+            Image.fromarray(rgba_thin, mode="RGBA").save(out_thin)
+
     return f"OK: {out_png}"
 
 
@@ -106,6 +139,9 @@ def main():
     p.add_argument("--radius", type=int, default=3,
                    help="Dilation radius in pixels. Width = 2*radius+1. "
                         "r=2→5px, r=3→7px (default), r=4→9px, r=5→11px")
+    p.add_argument("--thin_radius", type=int, default=None, metavar="N",
+                   help="Also output skeleton (thin) mask. r=0→1px, r=1→3px (recommended). "
+                        "Omit for backward compat (thick only).")
     p.add_argument("--workers", type=int, default=16,
                    help="Number of parallel threads")
     p.add_argument("--overwrite", action="store_true",
@@ -117,7 +153,10 @@ def main():
     regions = _find_region_dirs(args.data_root)
     print(f"Found {len(regions)} regions under {args.data_root}")
     print(f"Dilation radius: {args.radius}  →  road width = {2*args.radius+1} px")
-    print(f"Output file name: roadnet_normalized_r{args.radius}.png")
+    print(f"Output: roadnet_normalized_r{args.radius}.png")
+    if args.thin_radius is not None:
+        w = 1 if args.thin_radius == 0 else 2 * args.thin_radius + 1
+        print(f"Thin mask: roadnet_skeleton_r{args.thin_radius}.png  (width = {w} px)")
     if args.dry_run:
         return
 
@@ -128,7 +167,9 @@ def main():
 
     def _worker(indices):
         for i in indices:
-            results[i] = process_region(regions[i], args.radius, args.overwrite)
+            results[i] = process_region(
+                regions[i], args.radius, args.thin_radius, args.overwrite
+            )
             with lock:
                 done_cnt[0] += 1
                 n = done_cnt[0]

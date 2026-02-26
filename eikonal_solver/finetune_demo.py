@@ -37,6 +37,10 @@ class TrainConfig:
         self.PATCH_SIZE = 512
         self.NO_SAM = False
         self.USE_SAM_DECODER = False
+        # When True, the final ConvTranspose2d(32→2) is replaced by
+        # ConvTranspose2d(32→32) + Conv2d(32→2, k=3) to blend ViT token-grid
+        # boundaries and eliminate 16-px checkerboard artifacts.
+        self.USE_SMOOTH_DECODER = False
         self.ENCODER_LORA = False
         self.LORA_RANK = 4   # 仅当 ENCODER_LORA=True 时生效
         self.FREEZE_ENCODER = True   # 绝对冻结 SAM Encoder，只训练 Decoder（LoRA 模式必须 False）
@@ -88,18 +92,24 @@ class SingleRegionDataset(Dataset):
             img_array = img_array.astype(np.uint8)
         self.img_array = img_array
 
-        # 2. 加载 Masks (支持双目标)
+        # 2. 加载 Masks (支持双目标：thick for BCE, thin for thin_boost + Dice)
         masks_thick = glob.glob(os.path.join(region_dir, "roadnet_normalized_*.png"))
-        masks_thin = glob.glob(os.path.join(region_dir, "roadnet_*.png"))
-        masks_thin = [m for m in masks_thin if "normalized" not in m]
-        
+        masks_skel = glob.glob(os.path.join(region_dir, "roadnet_skeleton*.png"))
+        masks_orig = [m for m in glob.glob(os.path.join(region_dir, "roadnet_*.png"))
+                      if "normalized" not in m and "skeleton" not in m]
+
         # BCE 寻找宽掩码 (厚度保证高召回)
-        mask_path = masks_thick[0] if masks_thick else masks_thin[0]
+        mask_path = masks_thick[0] if masks_thick else masks_orig[0]
         self.mask_array = np.array(Image.open(mask_path).convert('L'))
-        
-        # Dice 寻找细掩码 (细度保证高定位)
-        if config.ROAD_DUAL_TARGET and masks_thin:
-            self.thin_mask_array = np.array(Image.open(masks_thin[0]).convert('L'))
+
+        # Dice / thin_boost 细掩码：优先 skeleton（按长度均权），否则原始
+        if config.ROAD_DUAL_TARGET:
+            if masks_skel:
+                self.thin_mask_array = np.array(Image.open(masks_skel[0]).convert('L'))
+            elif masks_orig:
+                self.thin_mask_array = np.array(Image.open(masks_orig[0]).convert('L'))
+            else:
+                self.thin_mask_array = None
         else:
             self.thin_mask_array = None
 
@@ -121,9 +131,11 @@ class SingleRegionDataset(Dataset):
     def __getitem__(self, idx):
         h, w = self.img_array.shape[:2]
         ps = self.patch_size
-        
-        y = np.random.randint(0, max(1, h - ps))
-        x = np.random.randint(0, max(1, w - ps))
+
+        # Use torch.randint so DataLoader worker fork seeds are independent,
+        # avoiding all workers producing identical crops (numpy shares fork state).
+        y = torch.randint(0, max(1, h - ps), (1,)).item()
+        x = torch.randint(0, max(1, w - ps), (1,)).item()
 
         # 🚀 核心修复：强制对齐到 16 的整数倍，彻底消灭特征图与 Mask 的空间错位！
         y = (y // 16) * 16
@@ -139,8 +151,24 @@ class SingleRegionDataset(Dataset):
             img_crop = np.pad(img_crop, ((0, pad_y), (0, pad_x), (0, 0)))
             mask_crop = np.pad(mask_crop, ((0, pad_y), (0, pad_x)))
 
+        rgb_t = torch.tensor(img_crop, dtype=torch.float32)
+
+        # Color jitter (same logic as dataset.py MMRouteDataset).
+        # Random brightness + contrast shift helps the model generalise
+        # across lighting conditions and reduces patch-level overfitting
+        # that can show up as blocky artifacts at inference time.
+        if self.feat_array is None:
+            # Only apply when the encoder runs live (cached features are
+            # pre-computed from unaugmented images, so jitter would create
+            # a mismatch between the stored features and the mask).
+            rgb_f = rgb_t / 255.0
+            brightness = 0.8 + torch.rand(1).item() * 0.4       # uniform [0.8, 1.2]
+            contrast_shift = (torch.rand(1).item() - 0.5) * 0.2  # uniform [-0.1, 0.1]
+            rgb_f = (rgb_f * brightness + contrast_shift).clamp(0.0, 1.0)
+            rgb_t = rgb_f * 255.0
+
         sample = {
-            'rgb': torch.tensor(img_crop, dtype=torch.float32),
+            'rgb': rgb_t,
             'road_mask': (torch.tensor(mask_crop, dtype=torch.float32) > 0).float()
         }
 
@@ -194,6 +222,9 @@ def train(args):
         config.ROAD_DICE_WEIGHT = args.road_dice_weight
     if args.road_thin_boost is not None:
         config.ROAD_THIN_BOOST = args.road_thin_boost
+    if args.smooth_decoder:
+        config.USE_SMOOTH_DECODER = True
+        print("平滑 Decoder 已启用（末端 3×3 Conv 抗马赛克）")
     model = SAMRoute(config)
 
     # 手动冻结本阶段不参与 Loss 的参数，满足 DDP 校验，从而使用标准 ddp 而非龟速 find_unused_parameters
@@ -328,9 +359,12 @@ def parse_args():
     p.add_argument("--road_dice_weight", type=float, default=None, help="Dice 损失权重，越大越强调细路")
     p.add_argument("--road_thin_boost", type=float, default=None, help="BCE 细路像素额外权重倍数 (默认 6.0)")
     p.add_argument("--run_name", type=str, default=None, help="参数扫描时指定，checkpoint 保存为 best_{run_name}.ckpt")
-    # LoRA  encoder 微调
+    # LoRA encoder 微调
     p.add_argument("--encoder_lora", action="store_true", help="开启 LoRA 微调 Encoder")
     p.add_argument("--lora_rank", type=int, default=4, help="LoRA rank，仅 --encoder_lora 时生效")
+    # 平滑 Decoder（抗马赛克）
+    p.add_argument("--smooth_decoder", action="store_true",
+                   help="使用平滑 Decoder（末端加 3×3 Conv，消除 16px ViT token 格栅伪影）")
     args = p.parse_args()
     args.preload_to_ram = not args.no_preload
     args.use_cached_features = args.use_cached_features and not args.no_cached_features
