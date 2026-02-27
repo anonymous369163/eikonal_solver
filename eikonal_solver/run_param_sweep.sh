@@ -31,9 +31,9 @@ fi
 
 # 单轮默认参数（跑一轮即可）
 # pos_weight 建议范围 5~10；15 会把模型推向"全图是路"的平凡解
-ROAD_POS_WEIGHT=8.0
-ROAD_DICE_WEIGHT=0.5
-ROAD_THIN_BOOST=4.0
+ROAD_POS_WEIGHT=10.0
+ROAD_DICE_WEIGHT=0.35
+ROAD_THIN_BOOST=2.5
 
 # LoRA 模式：设为 1 启用 LoRA encoder 微调，0 则只训练 Decoder
 ENCODER_LORA_MODE=1

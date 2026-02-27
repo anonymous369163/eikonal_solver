@@ -30,10 +30,10 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from eikonal import EikonalConfig, eikonal_soft_sweeping
-from evaluator import load_tif_image, pick_anchor_and_knn, spearmanr
+from backups.evaluator import load_tif_image, pick_anchor_and_knn, spearmanr
 from dataset import load_nodes_from_npz
 
-# ── Model loading utility ────────────────────────────────────────────────────
+# ── Model loading utility (aligned with test_inference) ────────────────────────
 
 @torch.no_grad()
 def load_model_road_prob(
@@ -42,8 +42,11 @@ def load_model_road_prob(
 ) -> torch.Tensor:
     """Load a trained SAMRoute model and predict road probability on rgb_ds.
 
+    Uses test_inference.load_model for checkpoint compatibility (decoder variant,
+    patch size auto-detection). Sliding-window + Hann blend for full-image prob.
+
     Args:
-        config_path: path to the YAML config used for training
+        config_path: path to YAML config (optional overrides; InferenceConfig used as base)
         ckpt_path:   path to the checkpoint (.ckpt)
         rgb_ds:      downsampled RGB tensor [1, 3, H, W] in [0, 1]
         device:      torch device
@@ -51,56 +54,38 @@ def load_model_road_prob(
     Returns:
         road_prob: [H, W] road probability tensor in [0, 1]
     """
-    import yaml
-    from addict import Dict as AdDict
-    from model import SAMRoute
+    from test_inference import InferenceConfig, load_model, sliding_window_inference
 
-    with open(config_path) as f:
-        config = AdDict(yaml.safe_load(f))
-    config_dir = os.path.dirname(os.path.abspath(config_path))
-    for key in ("SAM_CKPT_PATH", "PRETRAINED_CKPT"):
-        val = str(config.get(key, "") or "")
-        if val and not os.path.isabs(val):
-            config[key] = os.path.normpath(os.path.join(config_dir, val))
+    config = InferenceConfig()
+    if config_path and os.path.isfile(config_path):
+        import yaml
+        from addict import Dict as AdDict
+        with open(config_path) as f:
+            cfg = AdDict(yaml.safe_load(f))
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        # Resolve paths: config may live in backups/; '../' means from eikonal_solver upward
+        eikonal_dir = os.path.dirname(config_dir)  # eikonal_solver when config in backups/
+        for key in ("SAM_CKPT_PATH", "PRETRAINED_CKPT"):
+            val = str(cfg.get(key, "") or "")
+            if val and not os.path.isabs(val):
+                base = eikonal_dir if val.startswith("../") else config_dir
+                setattr(config, key, os.path.normpath(os.path.join(base, val)))
+        if "PATCH_SIZE" in cfg:
+            config.PATCH_SIZE = int(cfg.PATCH_SIZE)
 
-    model = SAMRoute(config)
-    try:
-        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        state = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(state.get("state_dict", state), strict=False)
-    model.eval().to(device)
-    print(f"[Model] Loaded {ckpt_path}")
-
-    PATCH = int(config.get("PATCH_SIZE", 512))
+    model = load_model(ckpt_path, config, device)
     _, _, H, W = rgb_ds.shape
-    road_prob_sum = torch.zeros(H, W, device=device)
-    weight_sum = torch.zeros(H, W, device=device)
-    stride = PATCH // 2
-
-    hann_1d = torch.hann_window(PATCH, device=device) + 1e-3
-    hann_2d = hann_1d[:, None] * hann_1d[None, :]
-
-    for y0 in range(0, H, stride):
-        for x0 in range(0, W, stride):
-            y1 = min(y0 + PATCH, H)
-            x1 = min(x0 + PATCH, W)
-            tile = rgb_ds[:, :, y0:y1, x0:x1]
-            if tile.shape[2] < PATCH or tile.shape[3] < PATCH:
-                tile = F.pad(tile, (0, PATCH - tile.shape[3],
-                                    0, PATCH - tile.shape[2]))
-            rgb_hwc = (tile * 255.0).squeeze(0).permute(1, 2, 0).unsqueeze(0)
-            _, ms = model._predict_mask_logits_scores(rgb_hwc.to(device))
-            rp = ms[0, :, :, 1].detach()
-            h_out = min(PATCH, H - y0)
-            w_out = min(PATCH, W - x0)
-            w = hann_2d[:h_out, :w_out]
-            road_prob_sum[y0:y0 + h_out, x0:x0 + w_out] += rp[:h_out, :w_out] * w
-            weight_sum[y0:y0 + h_out, x0:x0 + w_out] += w
-
-    road_prob = road_prob_sum / weight_sum.clamp(min=1e-6)
+    img_array = (rgb_ds[0].permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    prob_np = sliding_window_inference(
+        img_array, model, device,
+        patch_size=config.PATCH_SIZE,
+        stride=config.PATCH_SIZE // 2,
+        smooth_sigma=0.0,
+        verbose=False,
+    )
+    road_prob = torch.from_numpy(prob_np).float().to(device)
     v = road_prob.cpu().numpy().ravel()
-    in_01 = ((v > 0.01) & (v < 0.99)).sum() / len(v)
+    in_01 = ((v > 0.01) & (v < 0.99)).sum() / max(len(v), 1)
     print(f"  model road_prob: mean={road_prob.mean():.4f}, "
           f"p_in_(0,1)={in_01:.4f} ({in_01*100:.1f}%)")
     return road_prob
@@ -437,9 +422,11 @@ def eikonal_solve_true_multiscale(
             for k in ("T_patch", "T_coarse", "roi_y0", "roi_x0", "roi_P", "ds", "Pc", "src_coarse", "tgt_coarse"):
                 if k in src:
                     result[k] = src[k]
-            # Offset tracking for rendering paths in global space
-            result["global_y0"] = cy0 if (src == res_coarse) else fy0
-            result["global_x0"] = cx0 if (src == res_coarse) else fx0
+            # Offset tracking for rendering paths in global space (use "is" for identity, not "==")
+            result["global_y0"] = cy0 if (src is res_coarse) else fy0
+            result["global_x0"] = cx0 if (src is res_coarse) else fx0
+            # Indices of targets that have T values (for viz alignment with tgts_global)
+            result["viz_tgt_indices"] = idx_coarse.cpu().numpy() if (src is res_coarse) else idx_fine.cpu().numpy()
             
     return result
 
@@ -596,8 +583,12 @@ def visualize_cases(
     margin_fine: int = 64,
     pool_mode: str = "avg",
 ):
-    from evaluator import trace_path_from_T
-    from trainer import _plot_paths_standalone
+    try:
+        from backups.evaluator import trace_path_from_T
+        from backups.trainer import _plot_paths_standalone
+    except ImportError as e:
+        print(f"  [WARN] Visualization skipped: could not import backups ({e})")
+        return
     os.makedirs(save_dir, exist_ok=True)
     H_ds, W_ds = mask.shape[-2:]
     count = 0
@@ -670,8 +661,14 @@ def visualize_cases(
                     paths_global.append(None)
 
             anc_global = torch.tensor([ay, ax], device=device, dtype=torch.long)
-            tgts_global = nodes_yx[nn_kept]
-            nn_np = nn_kept.cpu().numpy().astype(int)
+            # When multiscale, t_vals/paths correspond to a subset (viz_tgt_indices)
+            viz_idx = result.get("viz_tgt_indices")
+            if viz_idx is not None:
+                tgts_global = nodes_yx[nn_kept][viz_idx]
+                nn_np = nn_kept.cpu().numpy().astype(int)[viz_idx]
+            else:
+                tgts_global = nodes_yx[nn_kept]
+                nn_np = nn_kept.cpu().numpy().astype(int)
 
             save_path = os.path.join(save_dir, f"case{case}_anc{anc_idx}.png")
             _plot_paths_standalone(
