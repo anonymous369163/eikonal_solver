@@ -742,9 +742,10 @@ def _prob_to_cost_smooth(
     supervision against GT pixel path lengths difficult.
     Consider _prob_to_cost_additive for a length-preserving alternative.
     """
-    prob = prob.clamp(0.0, 1.0)
+    prob = prob.clamp(eps, 1.0 - eps)
+    q = (1.0 - prob).clamp_min(eps)
     k = _math.log(max(float(offroad_penalty), 1.0 + 1e-6))
-    cost = torch.exp(k * (1.0 - prob).pow(gamma))
+    cost = torch.exp(k * q.pow(gamma))
     if block_th > 0.0:
         amp = 1.0 + 9.0 * torch.sigmoid(-float(block_smooth) * (prob - float(block_th)))
         cost = cost * amp
@@ -804,9 +805,12 @@ def _prob_to_cost_additive(
         p = 0.1  →  cost = 17.2  (+block≈50 if block_th=0.05)
         p = 0.0  →  cost = 21.0  (+block≈50)
     """
-    prob = prob.clamp(0.0, 1.0)
-    # base + polynomial penalty (alpha/gamma may be Tensor for learnable params)
-    cost = 1.0 + alpha * (1.0 - prob).pow(gamma)
+    # Clamp away from exact 0/1 to avoid log(0)=-inf in the backward of
+    # q.pow(gamma) when gamma is a learnable tensor: d/d(gamma)[q^gamma] =
+    # q^gamma * log(q), and 0*log(0) = 0*(-inf) = NaN in PyTorch.
+    prob = prob.clamp(eps, 1.0 - eps)
+    q = (1.0 - prob).clamp_min(eps)
+    cost = 1.0 + alpha * q.pow(gamma)
     # smooth hard-block near block_th (sigmoid gives a C∞ step)
     if block_th > 0.0 and block_alpha > 0.0:
         block = float(block_alpha) * torch.sigmoid(
@@ -1046,13 +1050,13 @@ class SAMRoute(SAMRoad):
         self.route_add_block_smooth = float(_cfg(config, "ROUTE_ADD_BLOCK_SMOOTH",  50.0))
         self.route_eps              = float(_cfg(config, "ROUTE_EPS",               1e-6))
         self.route_eik_cfg = EikonalConfig(
-            n_iters     = int(_cfg(config, "ROUTE_EIK_ITERS", 100)),
+            n_iters     = int(_cfg(config, "ROUTE_EIK_ITERS", 200)),
             tau_min     = 0.03,
             tau_branch  = 0.05,
             tau_update  = 0.03,
             use_redblack= True,
             monotone    = True,
-            mode       = "ste_train",
+            mode       = str(_cfg(config, "ROUTE_EIK_MODE", "soft_train")),
         )
         self.route_ckpt_chunk   = int(_cfg(config,   "ROUTE_CKPT_CHUNK",   10))
         self.route_roi_margin   = int(_cfg(config,   "ROUTE_ROI_MARGIN",   64))
@@ -1067,6 +1071,8 @@ class SAMRoute(SAMRoad):
         self.route_gate_alpha        = float(_cfg(config,"ROUTE_GATE_ALPHA",        0.8))
         self.route_eik_downsample    = int(_cfg(config,  "ROUTE_EIK_DOWNSAMPLE",   4))
         self.route_k_targets         = int(_cfg(config,  "ROUTE_K_TARGETS",        4))
+        self.route_cap_mode          = str(_cfg(config,  "ROUTE_CAP_MODE",        "tanh"))
+        self.route_cap_mult          = float(_cfg(config,"ROUTE_CAP_MULT",        10.0))
 
         # Learnable Eikonal-Euclidean blending gate (residual form)
         _gate_init = float(_cfg(config, "ROUTE_EIK_GATE_INIT", 0.80))
@@ -1178,6 +1184,35 @@ class SAMRoute(SAMRoad):
             block_smooth = self.route_add_block_smooth,
             eps          = self.route_eps,
         )
+
+    def _apply_dist_cap(
+        self,
+        pred_dist: torch.Tensor,
+        gt_dist: torch.Tensor,
+    ) -> tuple:
+        """Apply distance cap before loss computation.
+
+        Returns (pred_normed, gt_normed, sat_mask).
+        cap_mode controls the capping strategy:
+          - "tanh":  smooth cap, always differentiable (recommended)
+          - "clamp": hard cap, zero gradient in saturation zone
+          - "none":  no capping
+        """
+        norm = self.route_dist_norm_px
+        cap  = norm * self.route_cap_mult
+        mode = self.route_cap_mode
+
+        if mode == "tanh":
+            pred_c = cap * torch.tanh(pred_dist / cap)
+            sat = pred_dist > cap
+        elif mode == "clamp":
+            pred_c = pred_dist.clamp(max=cap)
+            sat = pred_dist > cap
+        else:
+            pred_c = pred_dist
+            sat = torch.zeros_like(pred_dist, dtype=torch.bool)
+
+        return pred_c / norm, gt_dist / norm, sat
 
     def _roi_eikonal_solve(
         self,
@@ -1485,9 +1520,7 @@ class SAMRoute(SAMRoad):
                 pred_dist_raw = self._roi_multi_target_diff_solve(
                     road_prob, src_yx, tgt_yx, gt_dist, eik_cfg)  # [B, K]
 
-                norm      = self.route_dist_norm_px
-                pred_norm = pred_dist_raw.clamp(max=norm * 10) / norm
-                gt_norm   = gt_dist / norm
+                pred_norm, gt_norm, _sat = self._apply_dist_cap(pred_dist_raw, gt_dist)
 
                 if valid.any():
                     loss_dist = self.dist_criterion(pred_norm[valid], gt_norm[valid])
@@ -1497,9 +1530,7 @@ class SAMRoute(SAMRoad):
             else:
                 # Legacy single-target format: tgt_yx [B, 2], gt_dist [B]
                 pred_dist_raw = self._roi_eikonal_solve(road_prob, src_yx, tgt_yx, eik_cfg)
-                norm      = self.route_dist_norm_px
-                pred_norm = pred_dist_raw.clamp(max=norm * 10) / norm
-                gt_norm   = gt_dist / norm
+                pred_norm, gt_norm, _sat = self._apply_dist_cap(pred_dist_raw, gt_dist)
                 loss_dist = self.dist_criterion(pred_norm, gt_norm)
                 valid     = torch.ones(gt_dist.shape, dtype=torch.bool,
                                        device=gt_dist.device)
@@ -1542,11 +1573,19 @@ class SAMRoute(SAMRoad):
         if self.route_lambda_dist > 0:
             grads = [p.grad for p in self.parameters() if p.grad is not None]
             if grads:
-                total_norm = torch.sqrt(sum(g.norm() ** 2 for g in grads))
-                self.log("grad_norm_total", total_norm, on_step=True, on_epoch=False)
-
                 has_nan = any(g.isnan().any() for g in grads)
                 has_inf = any(g.isinf().any() for g in grads)
+
+                if has_nan or has_inf:
+                    for p in self.parameters():
+                        if p.grad is not None and not torch.isfinite(p.grad).all():
+                            p.grad.zero_()
+                    self._nan_grad_skipped = True
+                else:
+                    self._nan_grad_skipped = False
+
+                total_norm = torch.sqrt(sum(g.norm() ** 2 for g in grads))
+                self.log("grad_norm_total", total_norm, on_step=True, on_epoch=False)
                 self.log("grad_has_nan", float(has_nan), on_step=True, on_epoch=False)
                 self.log("grad_has_inf", float(has_inf), on_step=True, on_epoch=False)
 
@@ -1577,9 +1616,7 @@ class SAMRoute(SAMRoad):
                     valid = gt_dist > 0
                     pred_dist_raw = self._roi_multi_target_diff_solve(
                         road_prob, src_yx, tgt_yx, gt_dist)  # [B, K]
-                    norm      = self.route_dist_norm_px
-                    pred_norm = pred_dist_raw.clamp(max=norm * 10) / norm
-                    gt_norm   = gt_dist / norm
+                    pred_norm, gt_norm, _sat = self._apply_dist_cap(pred_dist_raw, gt_dist)
                     if valid.any():
                         loss_dist = self.dist_criterion(pred_norm[valid], gt_norm[valid])
                     else:
@@ -1587,9 +1624,7 @@ class SAMRoute(SAMRoad):
                 else:
                     # Legacy single-target format
                     pred_dist_raw = self._roi_eikonal_solve(road_prob, src_yx, tgt_yx)
-                    norm      = self.route_dist_norm_px
-                    pred_norm = pred_dist_raw.clamp(max=norm * 10) / norm
-                    gt_norm   = gt_dist / norm
+                    pred_norm, gt_norm, _sat = self._apply_dist_cap(pred_dist_raw, gt_dist)
                     loss_dist = self.dist_criterion(pred_norm, gt_norm)
             loss = loss + self.route_lambda_dist * loss_dist
             self.log("val_dist_loss", loss_dist, on_step=False, on_epoch=True, prog_bar=True)

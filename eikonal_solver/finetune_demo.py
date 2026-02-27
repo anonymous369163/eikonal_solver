@@ -62,9 +62,24 @@ class TrainConfig:
 
         self.ROUTE_LAMBDA_SEG = 1.0
         self.ROUTE_LAMBDA_DIST = 0.0
-        self.BASE_LR = 5e-4  # 配合 batch_size=16，较 4 时适当放大
-        self.ENCODER_LR_FACTOR = 0.1   # configure_optimizers 需此属性
-        self.LR_MILESTONES = [150] 
+        self.BASE_LR = 5e-4
+        self.ENCODER_LR_FACTOR = 0.1
+
+        # Eikonal solver configuration (active when ROUTE_LAMBDA_DIST > 0)
+        self.ROUTE_EIK_ITERS = 200
+        self.ROUTE_EIK_DOWNSAMPLE = 4
+        self.ROUTE_EIK_MODE = "soft_train"
+        self.ROUTE_CAP_MODE = "tanh"
+        self.ROUTE_CAP_MULT = 10.0
+        self.ROUTE_CKPT_CHUNK = 10
+        self.ROUTE_DIST_NORM_PX = 512.0
+        self.ROUTE_GATE_ALPHA = 0.8
+        self.ROUTE_ROI_MARGIN = 64
+        self.ROUTE_EIK_WARMUP_EPOCHS = 5
+        self.ROUTE_EIK_ITERS_MIN = 30
+        self.ROUTE_DIST_WARMUP_STEPS = 500
+
+        self.LR_MILESTONES = [150]
 
     def get(self, key, default):
         return getattr(self, key, default)
@@ -225,6 +240,20 @@ def train(args):
     if args.smooth_decoder:
         config.USE_SMOOTH_DECODER = True
         print("平滑 Decoder 已启用（末端 3×3 Conv 抗马赛克）")
+    if args.lambda_dist is not None:
+        config.ROUTE_LAMBDA_DIST = args.lambda_dist
+    if args.eik_iters is not None:
+        config.ROUTE_EIK_ITERS = args.eik_iters
+    if args.eik_downsample is not None:
+        config.ROUTE_EIK_DOWNSAMPLE = args.eik_downsample
+    if args.eik_mode is not None:
+        config.ROUTE_EIK_MODE = args.eik_mode
+    if args.cap_mode is not None:
+        config.ROUTE_CAP_MODE = args.cap_mode
+    if config.ROUTE_LAMBDA_DIST > 0:
+        print(f"Distance loss enabled: lambda_dist={config.ROUTE_LAMBDA_DIST}, "
+              f"eik_iters={config.ROUTE_EIK_ITERS}, ds={config.ROUTE_EIK_DOWNSAMPLE}, "
+              f"mode={config.ROUTE_EIK_MODE}, cap={config.ROUTE_CAP_MODE}")
     model = SAMRoute(config)
 
     # 手动冻结本阶段不参与 Loss 的参数，满足 DDP 校验，从而使用标准 ddp 而非龟速 find_unused_parameters
@@ -272,7 +301,7 @@ def train(args):
             patch_size=config.PATCH_SIZE,
             batch_size=args.batch_size,
             num_workers=args.workers,
-            include_dist=False,
+            include_dist=(config.ROUTE_LAMBDA_DIST > 0),
             val_fraction=args.val_fraction,
             samples_per_region=args.samples_per_region,
             use_cached_features=args.use_cached_features,
@@ -365,6 +394,17 @@ def parse_args():
     # 平滑 Decoder（抗马赛克）
     p.add_argument("--smooth_decoder", action="store_true",
                    help="使用平滑 Decoder（末端加 3×3 Conv，消除 16px ViT token 格栅伪影）")
+    # Eikonal distance loss
+    p.add_argument("--lambda_dist", type=float, default=None,
+                   help="Distance loss weight (default 0.0 = off). Set >0 to enable.")
+    p.add_argument("--eik_iters", type=int, default=None, help="Eikonal iterations (default 200)")
+    p.add_argument("--eik_downsample", type=int, default=None, help="Eikonal downsample factor (default 4)")
+    p.add_argument("--eik_mode", type=str, default=None,
+                   choices=["soft_train", "ste_train", "hard_eval"],
+                   help="Eikonal solver mode (default soft_train)")
+    p.add_argument("--cap_mode", type=str, default=None,
+                   choices=["tanh", "clamp", "none"],
+                   help="Distance cap mode (default tanh)")
     args = p.parse_args()
     args.preload_to_ram = not args.no_preload
     args.use_cached_features = args.use_cached_features and not args.no_cached_features
