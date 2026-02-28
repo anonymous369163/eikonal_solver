@@ -26,7 +26,7 @@ from PIL import Image
 import os
 import tifffile
 
-from model import SAMRoute
+from model_multigrid import SAMRoute
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.normpath(os.path.join(_SCRIPT_DIR, ".."))

@@ -25,7 +25,7 @@ except ImportError:
     from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
     from pytorch_lightning.loggers import TensorBoardLogger
 
-from model import SAMRoute
+from model_multigrid import SAMRoute
 from dataset import build_dataloaders
 
 # ==========================================
