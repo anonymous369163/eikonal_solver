@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from typing import Dict, Any, Optional, Tuple, List
 
 import numpy as np
@@ -751,6 +752,24 @@ def main():
     ap.add_argument("--mg_fine_monotone", action="store_true",
                     help="Use monotone=True in fine stage (requires warm-start upper bound)")
 
+    # [MOD] Tube ROI options (further acceleration for large ROIs)
+    ap.add_argument("--tube_roi", action="store_true",
+                    help="Enable Tube ROI: crop fine stage to corridor bbox (multigrid only)")
+    ap.add_argument("--tube_min_pc", type=int, default=256,
+                    help="Only enable tube when fine grid side P_c >= this")
+    ap.add_argument("--tube_radius_c", type=int, default=8,
+                    help="Coarse-grid radius (cells) around backtracked path")
+    ap.add_argument("--tube_pad_c", type=int, default=4,
+                    help="Extra coarse-grid padding on tube bbox")
+    ap.add_argument("--tube_max_area_ratio", type=float, default=0.90,
+                    help="Skip tube if bbox area / full area >= this")
+    ap.add_argument("--tube_min_side", type=int, default=16,
+                    help="Minimum tube bbox side length (fine grid)")
+    ap.add_argument("--profile_time", action="store_true",
+                    help="Print per-step timing (pred/backward/step); CUDA sync")
+    ap.add_argument("--tube_compare_baseline", action="store_true",
+                    help="At step 0, also compute non-tube multigrid and report distance diff")
+
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -918,6 +937,8 @@ def main():
     else:
         print(f"[vis] using pair: b={b0}, k={k0}")
 
+    _use_cuda_sync = args.profile_time and device.type == "cuda"
+
     for step in range(int(args.steps)):
         opt.zero_grad(set_to_none=True)
 
@@ -933,8 +954,12 @@ def main():
         tgt_yx = batch["tgt_yx"]
         gt_dist = batch["gt_dist"].to(torch.float32)
 
-        # 距离预测（可微）：[B, K]
-        # [MOD] distance prediction (differentiable): baseline vs multigrid warm-start
+        # --- profiling start ---
+        if _use_cuda_sync:
+            torch.cuda.synchronize()
+        t_pred_start = time.perf_counter()
+
+        # distance prediction (differentiable): baseline vs multigrid warm-start
         if args.multigrid:
             pred_dist = model._roi_multi_target_multigrid_diff_solve(
                 road_prob,
@@ -948,11 +973,21 @@ def main():
                 mg_detach_coarse=bool(args.mg_detach_coarse),
                 mg_interp=str(args.mg_interp),
                 fine_monotone=bool(args.mg_fine_monotone),
+                tube_roi=bool(args.tube_roi),
+                tube_min_Pc=int(args.tube_min_pc),
+                tube_radius_c=int(args.tube_radius_c),
+                tube_pad_c=int(args.tube_pad_c),
+                tube_max_area_ratio=float(args.tube_max_area_ratio),
+                tube_min_side=int(args.tube_min_side),
             )
         else:
             pred_dist = model._roi_multi_target_diff_solve(road_prob, src_yx, tgt_yx, gt_dist, model.route_eik_cfg)
 
-        # 归一化 + 距离损失（支持 cap_mode）
+        if _use_cuda_sync:
+            torch.cuda.synchronize()
+        t_pred_end = time.perf_counter()
+
+        #归一化 + 距离损失（支持 cap_mode）
         norm = float(getattr(cfg, "ROUTE_DIST_NORM_PX", 512.0))
         valid = gt_dist > 0
         if valid.any():
@@ -972,7 +1007,36 @@ def main():
             max_pred = 0.0
 
         loss = loss + cfg.ROUTE_LAMBDA_DIST * loss_dist
+
+        if _use_cuda_sync:
+            torch.cuda.synchronize()
+        t_bwd_start = time.perf_counter()
         loss.backward()
+        if _use_cuda_sync:
+            torch.cuda.synchronize()
+        t_bwd_end = time.perf_counter()
+
+        # --- tube_compare_baseline: at step 0, compare tube vs non-tube ---
+        if step == 0 and args.tube_compare_baseline and args.multigrid and args.tube_roi:
+            with torch.no_grad():
+                pred_base = model._roi_multi_target_multigrid_diff_solve(
+                    road_prob.detach(),
+                    src_yx, tgt_yx, gt_dist, model.route_eik_cfg,
+                    mg_factor=int(args.mg_factor),
+                    mg_iters_coarse=mg_itc,
+                    mg_iters_fine=mg_itf,
+                    mg_detach_coarse=bool(args.mg_detach_coarse),
+                    mg_interp=str(args.mg_interp),
+                    fine_monotone=bool(args.mg_fine_monotone),
+                    tube_roi=False,
+                )
+                v = gt_dist > 0
+                if v.any():
+                    diff = (pred_dist.detach()[v] - pred_base[v]).abs()
+                    rel = diff / (pred_base[v].abs() + 1e-6)
+                    print(f"  [tube_vs_base] abs_diff_mean={diff.mean():.3f}  "
+                          f"abs_diff_max={diff.max():.3f}  "
+                          f"rel_mean={rel.mean():.4f}  rel_max={rel.max():.4f}")
 
         # ---- print sanity stats ----
         with torch.no_grad():
@@ -1004,6 +1068,23 @@ def main():
             ),
         )
 
+        # --- profiling: print per-step timing ---
+        if args.profile_time:
+            print(f"  [time] pred={t_pred_end - t_pred_start:.3f}s  "
+                  f"bwd={t_bwd_end - t_bwd_start:.3f}s  "
+                  f"total_fwd_bwd={t_bwd_end - t_pred_start:.3f}s")
+
+        # --- tube_meta: print tube usage info ---
+        if args.multigrid and hasattr(model, '_last_tube_meta'):
+            meta = model._last_tube_meta
+            oob = meta.get('oob_count', 0)
+            oob_str = f"  oob={oob}" if oob > 0 else ""
+            print(f"  [tube_meta] use={meta.get('use_tube', False)}  "
+                  f"P_c={meta.get('P_c')}  tube={meta.get('tube_h')}x{meta.get('tube_w')}  "
+                  f"area_ratio={meta.get('tube_area_ratio', 1.0):.3f}  "
+                  f"iters_fine={meta.get('iters_fine', '?')}  "
+                  f"iters_coarse={meta.get('iters_coarse', '?')}{oob_str}")
+
         if step == 0:
             prob_before = road_prob_raw.detach().clone()   # 用原始 road_prob（未 clone）保存“优化前”
             pred_before = pred_dist.detach().clone()
@@ -1034,6 +1115,12 @@ def main():
                 mg_detach_coarse=bool(args.mg_detach_coarse),
                 mg_interp=str(args.mg_interp),
                 fine_monotone=bool(args.mg_fine_monotone),
+                tube_roi=bool(args.tube_roi),
+                tube_min_Pc=int(args.tube_min_pc),
+                tube_radius_c=int(args.tube_radius_c),
+                tube_pad_c=int(args.tube_pad_c),
+                tube_max_area_ratio=float(args.tube_max_area_ratio),
+                tube_min_side=int(args.tube_min_side),
             )
         else:
             pred_dist2 = model._roi_multi_target_diff_solve(

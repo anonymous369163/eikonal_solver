@@ -1185,6 +1185,14 @@ class SAMRoute(SAMRoad):
         self.route_mg_detach_coarse  = bool(_cfg(config, "ROUTE_MG_DETACH_COARSE",False))
         self.route_mg_interp         = str(_cfg(config,  "ROUTE_MG_INTERP",       "bilinear"))
 
+        # --- Tube ROI config (optional acceleration for large ROIs) ---
+        self.route_tube_roi            = bool(_cfg(config, "ROUTE_TUBE_ROI",            False))
+        self.route_tube_min_Pc         = int(_cfg(config,  "ROUTE_TUBE_MIN_PC",         256))
+        self.route_tube_radius_c       = int(_cfg(config,  "ROUTE_TUBE_RADIUS_C",       8))
+        self.route_tube_pad_c          = int(_cfg(config,  "ROUTE_TUBE_PAD_C",          4))
+        self.route_tube_max_area_ratio = float(_cfg(config, "ROUTE_TUBE_MAX_AREA_RATIO", 0.90))
+        self.route_tube_min_side       = int(_cfg(config,  "ROUTE_TUBE_MIN_SIDE",       16))
+
         # Learnable Eikonal-Euclidean blending gate (residual form)
         _gate_init = float(_cfg(config, "ROUTE_EIK_GATE_INIT", 0.80))
         _gate_init = max(0.01, min(0.99, _gate_init))
@@ -1640,6 +1648,12 @@ class SAMRoute(SAMRoad):
                         mg_iters_fine=itf,
                         mg_detach_coarse=self.route_mg_detach_coarse,
                         mg_interp=self.route_mg_interp,
+                        tube_roi=self.route_tube_roi,
+                        tube_min_Pc=self.route_tube_min_Pc,
+                        tube_radius_c=self.route_tube_radius_c,
+                        tube_pad_c=self.route_tube_pad_c,
+                        tube_max_area_ratio=self.route_tube_max_area_ratio,
+                        tube_min_side=self.route_tube_min_side,
                     )
                 else:
                     pred_dist_raw = self._roi_multi_target_diff_solve(
@@ -1751,6 +1765,12 @@ class SAMRoute(SAMRoad):
                             mg_iters_fine=itf,
                             mg_detach_coarse=self.route_mg_detach_coarse,
                             mg_interp=self.route_mg_interp,
+                            tube_roi=self.route_tube_roi,
+                            tube_min_Pc=self.route_tube_min_Pc,
+                            tube_radius_c=self.route_tube_radius_c,
+                            tube_pad_c=self.route_tube_pad_c,
+                            tube_max_area_ratio=self.route_tube_max_area_ratio,
+                            tube_min_side=self.route_tube_min_side,
                         )
                     else:
                         pred_dist_raw = self._roi_multi_target_diff_solve(
@@ -2004,21 +2024,20 @@ class SAMRoute(SAMRoad):
         mg_detach_coarse: bool = False,
         mg_interp: str = "bilinear",
         fine_monotone: bool = False,
+        # --- Tube ROI: optional acceleration for large ROIs ---
+        tube_roi: bool = False,
+        tube_min_Pc: int = 256,
+        tube_radius_c: int = 8,
+        tube_pad_c: int = 4,
+        tube_max_area_ratio: float = 0.90,
+        tube_min_side: int = 16,
     ) -> torch.Tensor:
-        """[MOD] Multigrid warm-start differentiable Eikonal solve (one-src → K-targets).
+        """[MOD] Multigrid warm-start differentiable Eikonal solve (one-src → K-targets),
+        with optional Tube ROI acceleration.
 
-        Motivation (large ROI on high-res imagery):
-          - Baseline solver requires n_iters ≳ P_c (coarse grid diameter) for the wavefront
-            to reach far targets. When nodes are far apart, P_c is large and this becomes slow.
-          - Multigrid: solve on a much coarser grid first, upsample its T field as an initial
-            guess, then refine on the finer grid with far fewer iterations.
-
-        Notes on correctness & gradients:
-          - Everything is differentiable (max_pool2d, interpolate, soft sweeping), so gradients
-            can flow end-to-end.
-          - For refinement, we default to fine_monotone=False because a coarse solution can
-            underestimate the fine solution; with monotone=True the solver cannot increase T.
-            (If you can guarantee an upper-bound warm start, you may set fine_monotone=True.)
+        Multigrid reduces iteration count via coarse warm-start.
+        Tube ROI additionally reduces per-iteration grid size (HW) in the fine stage
+        by cropping to a bounding box around the coarse-grid backtracked paths.
 
         Args:
             mg_factor:        coarse_ds = ds_common * mg_factor
@@ -2027,6 +2046,12 @@ class SAMRoute(SAMRoad):
             mg_detach_coarse: stop gradients through coarse stage (often OK; speeds backward)
             mg_interp:        'nearest' or 'bilinear' upsample for warm start
             fine_monotone:    whether to use cfg.monotone in fine stage
+            tube_roi:         enable tube ROI cropping (only affects fine stage)
+            tube_min_Pc:      only enable tube when P_c >= this (small ROI: overhead > benefit)
+            tube_radius_c:    coarse-grid radius (cells) around backtracked paths
+            tube_pad_c:       extra coarse-grid padding on bbox
+            tube_max_area_ratio: skip tube if bbox area / full area >= this
+            tube_min_side:    minimum tube bbox side length (fine grid pixels)
         """
         from dataclasses import replace as _replace
 
@@ -2133,6 +2158,35 @@ class SAMRoute(SAMRoad):
         cost_f = torch.stack(costs_f)  # [B, P_c, P_c]
         cost_c = torch.stack(costs_c)  # [B, P_c2, P_c2]
 
+        # Pre-compute fine/coarse grid coordinates for src and targets (needed by tube)
+        src_f_yx = []   # [(sf_y, sf_x), ...] per batch
+        src_c_yx = []
+        tgt_f_yx = []   # [[(tf_y, tf_x)|None, ...], ...] per batch, per K
+        tgt_c_yx = []
+        for b in range(B):
+            y0, x0, _P, sr_y, sr_x, _ds_b, valid_mask = geom[b]
+            sf_y = max(0, min(sr_y // ds_common, P_c - 1))
+            sf_x = max(0, min(sr_x // ds_common, P_c - 1))
+            src_f_yx.append((sf_y, sf_x))
+            sc_y = max(0, min(sr_y // ds_coarse, P_c2 - 1))
+            sc_x = max(0, min(sr_x // ds_coarse, P_c2 - 1))
+            src_c_yx.append((sc_y, sc_x))
+            tgts = tgt_yx_k[b]
+            tf_list, tc_list = [], []
+            for k in range(K):
+                if valid_mask[k]:
+                    ty = int(tgts[k, 0].item())
+                    tx = int(tgts[k, 1].item())
+                    tf_list.append((max(0, min((ty - y0) // ds_common, P_c - 1)),
+                                    max(0, min((tx - x0) // ds_common, P_c - 1))))
+                    tc_list.append((max(0, min((ty - y0) // ds_coarse, P_c2 - 1)),
+                                    max(0, min((tx - x0) // ds_coarse, P_c2 - 1))))
+                else:
+                    tf_list.append(None)
+                    tc_list.append(None)
+            tgt_f_yx.append(tf_list)
+            tgt_c_yx.append(tc_list)
+
         # -------------------------
         # Pass 3: coarse solve -> warm-start
         # -------------------------
@@ -2165,13 +2219,167 @@ class SAMRoute(SAMRoad):
             T_init = F.interpolate(T_c.unsqueeze(1), size=(P_c, P_c), mode="bilinear", align_corners=False).squeeze(1)
 
         # clamp to sane range & enforce boundary
-        T_init = T_init.clamp_min(0.0).clamp_max(large_val)
-        T_init = torch.where(src_f, torch.zeros_like(T_init), T_init)
+        T_init_full = T_init.clamp_min(0.0).clamp_max(large_val)
+        T_init_full = torch.where(src_f, torch.zeros_like(T_init_full), T_init_full)
+
+        # -------------------------
+        # Pass 3.5 (optional): Tube ROI — crop fine-stage to corridor bbox
+        # -------------------------
+        use_tube = bool(tube_roi) and (P_c >= int(tube_min_Pc))
+        tube_h = P_c
+        tube_w = P_c
+        tube_area_ratio = 1.0
+
+        cost_ref  = cost_f
+        src_ref   = src_f
+        T_init_ref = T_init_full
+        off_f = [(0, 0)] * B          # per-batch (y, x) offset in fine grid
+
+        if use_tube:
+            tube_radius_c = max(0, int(tube_radius_c))
+            tube_pad_c    = max(0, int(tube_pad_c))
+            tube_min_side = max(4, int(tube_min_side))
+            tube_max_area_ratio = float(tube_max_area_ratio)
+
+            with torch.no_grad():
+                T_cpu_list = [T_c[b].detach().cpu() for b in range(B)]
+
+            def _backtrack(T2d, sy, sx, ty, tx, max_steps):
+                """Greedy 8-neighbor gradient descent from target back to source."""
+                H2, W2 = T2d.shape
+                if float(T2d[ty, tx].item()) > large_val * 0.9:
+                    return [(ty, tx)]
+                path = []
+                cy, cx = ty, tx
+                for _ in range(max_steps):
+                    path.append((cy, cx))
+                    if cy == sy and cx == sx:
+                        break
+                    best_y, best_x, best_v = cy, cx, float(T2d[cy, cx].item())
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            if dy == 0 and dx == 0:
+                                continue
+                            ny, nx = cy + dy, cx + dx
+                            if 0 <= ny < H2 and 0 <= nx < W2:
+                                v = float(T2d[ny, nx].item())
+                                if v < best_v:
+                                    best_v, best_y, best_x = v, ny, nx
+                    if best_y == cy and best_x == cx:
+                        break
+                    cy, cx = best_y, best_x
+                return path
+
+            bboxes_f = []
+            for b in range(B):
+                scy, scx = src_c_yx[b]
+                pts = []
+                T2d = T_cpu_list[b]
+                max_bt_steps = int(4 * max(P_c2, 8))
+                has_any = False
+                for k in range(K):
+                    tc = tgt_c_yx[b][k]
+                    if tc is None:
+                        continue
+                    has_any = True
+                    pts.extend(_backtrack(T2d, scy, scx, tc[0], tc[1], max_bt_steps))
+
+                if (not has_any) or len(pts) == 0:
+                    bboxes_f.append((0, P_c, 0, P_c))
+                    continue
+
+                ys = [p[0] for p in pts] + [scy]
+                xs = [p[1] for p in pts] + [scx]
+                for k in range(K):
+                    tc = tgt_c_yx[b][k]
+                    if tc is not None:
+                        ys.append(tc[0]); xs.append(tc[1])
+
+                y0c = max(0, min(ys) - tube_radius_c - tube_pad_c)
+                y1c = min(P_c2, max(ys) + tube_radius_c + tube_pad_c + 1)
+                x0c = max(0, min(xs) - tube_radius_c - tube_pad_c)
+                x1c = min(P_c2, max(xs) + tube_radius_c + tube_pad_c + 1)
+
+                safety = int(max(1, mg_factor))
+                y0f = max(0, y0c * mg_factor - safety)
+                y1f = min(P_c, y1c * mg_factor + safety)
+                x0f = max(0, x0c * mg_factor - safety)
+                x1f = min(P_c, x1c * mg_factor + safety)
+
+                if (y1f - y0f) < tube_min_side:
+                    mid = (y0f + y1f) // 2
+                    y0f = max(0, mid - tube_min_side // 2)
+                    y1f = min(P_c, y0f + tube_min_side)
+                if (x1f - x0f) < tube_min_side:
+                    mid = (x0f + x1f) // 2
+                    x0f = max(0, mid - tube_min_side // 2)
+                    x1f = min(P_c, x0f + tube_min_side)
+
+                sfy, sfx = src_f_yx[b]
+                y0f = min(y0f, sfy); y1f = max(y1f, sfy + 1)
+                x0f = min(x0f, sfx); x1f = max(x1f, sfx + 1)
+                for k in range(K):
+                    tf = tgt_f_yx[b][k]
+                    if tf is not None:
+                        y0f = min(y0f, tf[0]); y1f = max(y1f, tf[0] + 1)
+                        x0f = min(x0f, tf[1]); x1f = max(x1f, tf[1] + 1)
+
+                y0f = max(0, int(y0f)); x0f = max(0, int(x0f))
+                y1f = min(P_c, int(y1f)); x1f = min(P_c, int(x1f))
+                bboxes_f.append((y0f, y1f, x0f, x1f))
+
+            h_list = [bb[1] - bb[0] for bb in bboxes_f]
+            w_list = [bb[3] - bb[2] for bb in bboxes_f]
+            tube_h = max(h_list) if h_list else P_c
+            tube_w = max(w_list) if w_list else P_c
+            tube_area_ratio = float(tube_h * tube_w) / float(max(P_c * P_c, 1))
+
+            if tube_area_ratio >= tube_max_area_ratio:
+                use_tube = False
+            else:
+                with torch.no_grad():
+                    pad_cost_val = float(
+                        self._road_prob_to_cost(torch.zeros((), device=device)).detach().item())
+                cost_ref_list = []
+                src_ref   = torch.zeros(B, tube_h, tube_w, dtype=torch.bool, device=device)
+                T_init_list = []
+                off_f = []
+                for b in range(B):
+                    y0f, y1f, x0f, x1f = bboxes_f[b]
+                    off_f.append((y0f, x0f))
+                    c  = cost_f[b, y0f:y1f, x0f:x1f]
+                    t0 = T_init_full[b, y0f:y1f, x0f:x1f]
+                    s  = src_f[b, y0f:y1f, x0f:x1f]
+
+                    dh = tube_h - c.shape[0]
+                    dw = tube_w - c.shape[1]
+                    if dh > 0 or dw > 0:
+                        c  = F.pad(c,  (0, dw, 0, dh), value=pad_cost_val)
+                        t0 = F.pad(t0, (0, dw, 0, dh), value=large_val)
+                        s  = F.pad(s,  (0, dw, 0, dh), value=False)
+
+                    cost_ref_list.append(c)
+                    T_init_list.append(t0)
+                    src_ref[b] = s
+                cost_ref   = torch.stack(cost_ref_list)
+                T_init_ref = torch.stack(T_init_list)
+                T_init_ref = torch.where(src_ref, torch.zeros_like(T_init_ref), T_init_ref)
+
+        try:
+            self._last_tube_meta = {
+                "use_tube": bool(use_tube),
+                "P_c": int(P_c), "P_c2": int(P_c2),
+                "tube_h": int(tube_h), "tube_w": int(tube_w),
+                "tube_area_ratio": float(tube_area_ratio),
+            }
+        except Exception:
+            pass
 
         # -------------------------
         # Pass 4: fine refinement with warm start
         # -------------------------
-        actual_iters_fine = int(max(mg_iters_fine, int(P_c * 0.8)))
+        P_for_floor = int(max(tube_h, tube_w)) if use_tube else P_c
+        actual_iters_fine = int(max(mg_iters_fine, int(P_for_floor * 0.8)))
         cfg_f = _replace(
             cfg,
             h=float(ds_common),
@@ -2179,34 +2387,61 @@ class SAMRoute(SAMRoad):
             monotone=bool(fine_monotone),
         )
 
-        T_all = _eikonal_soft_sweeping_diff_init(
-            cost_f,
-            src_f,
+        T_ref = _eikonal_soft_sweeping_diff_init(
+            cost_ref,
+            src_ref,
             cfg_f,
-            T_init,
+            T_init_ref,
             checkpoint_chunk=self.route_ckpt_chunk,
             gate_alpha=self.route_gate_alpha,
-        )  # [B, P_c, P_c]
+        )  # [B, tube_h, tube_w] or [B, P_c, P_c]
+
+        try:
+            self._last_tube_meta["iters_fine"] = int(actual_iters_fine)
+            self._last_tube_meta["iters_coarse"] = int(actual_iters_coarse)
+            self._last_tube_meta["oob_count"] = 0
+        except Exception:
+            pass
 
         # -------------------------
-        # Pass 5: read K targets
+        # Pass 5: read K targets (tube-offset-aware)
         # -------------------------
+        oob_count = 0
         all_dists: list = []
         for b in range(B):
-            y0, x0, _P, _sr_y, _sr_x, _ds_b, valid_mask = geom[b]
-            tgts = tgt_yx_k[b]
-            T_b  = T_all[b]
+            valid_mask = geom[b][6]
+            T_b  = T_ref[b]
+            Href, Wref = T_b.shape[0], T_b.shape[1]
+            yoff, xoff = off_f[b]
             dists_b = []
             for k in range(K):
                 if valid_mask[k]:
-                    ty = int(tgts[k, 0].item())
-                    tx = int(tgts[k, 1].item())
-                    tc_y = max(0, min((ty - y0) // ds_common, P_c - 1))
-                    tc_x = max(0, min((tx - x0) // ds_common, P_c - 1))
-                    dists_b.append(T_b[tc_y, tc_x])
+                    tf = tgt_f_yx[b][k]
+                    if tf is None:
+                        dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
+                        continue
+                    ty = int(tf[0] - yoff)
+                    tx = int(tf[1] - xoff)
+                    if ty < 0 or ty >= Href or tx < 0 or tx >= Wref:
+                        oob_count += 1
+                        dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
+                        continue
+                    dists_b.append(T_b[ty, tx])
                 else:
-                    dists_b.append(torch.tensor(large_val, device=device, dtype=cost_f.dtype))
+                    dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
             all_dists.append(torch.stack(dists_b))
+
+        if use_tube:
+            try:
+                self._last_tube_meta["oob_count"] = int(oob_count)
+            except Exception:
+                pass
+            if oob_count > 0:
+                import warnings
+                warnings.warn(
+                    f"[tube] {oob_count} target(s) fell outside tube bbox — "
+                    f"bbox construction may have an alignment bug"
+                )
 
         T_eik = torch.stack(all_dists)  # [B, K]
         d_euc = ((src_yx.unsqueeze(1).float() - tgt_yx_k.float()) ** 2).sum(-1).sqrt()  # [B, K]
