@@ -198,6 +198,34 @@ class _LoRA_qkv(nn.Module):
 
 
 
+
+class ResidualCostNet(torch.nn.Module):
+    """Lightweight CNN that predicts a bounded log-cost residual from a prob map.
+
+    Designed as a *local patcher* on top of the hand-crafted prob→cost formula.
+
+    We predict delta_log_cost (bounded by tanh), and apply:
+        cost = base_cost * exp(delta_log_cost)
+
+    This guarantees strictly-positive cost and keeps the residual small at init
+    (last layer is zero-initialized).
+    """
+
+    def __init__(self, in_ch: int = 1, mid_ch: int = 8):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(mid_ch, 1, kernel_size=1, bias=False),
+        )
+        torch.nn.init.zeros_(self.net[-1].weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, H, W] → [B, 1, H, W]
+        return self.net(x)
+
 class SAMRoad(pl.LightningModule):
     """This is the RelationFormer module that performs object detection"""
 
@@ -797,6 +825,7 @@ def _prob_to_cost_additive(
         eps:          Floor to keep cost strictly positive.
 
     Typical cost values with defaults (alpha=20, gamma=2):
+    prob = prob.clamp(eps, 1.0 - eps)
         p = 1.0  →  cost =  1.0
         p = 0.9  →  cost =  1.2
         p = 0.7  →  cost =  2.8
@@ -891,31 +920,12 @@ def _eikonal_iter_chunk(
     return T
 
 
-_eikonal_iter_chunk_compiled = None
-
-
-def _get_compiled_eikonal_iter_chunk():
-    """Lazily compile _eikonal_iter_chunk with torch.compile (PyTorch 2.0+)."""
-    global _eikonal_iter_chunk_compiled
-    if _eikonal_iter_chunk_compiled is not None:
-        return _eikonal_iter_chunk_compiled
-    try:
-        _eikonal_iter_chunk_compiled = torch.compile(
-            _eikonal_iter_chunk, mode="reduce-overhead", fullgraph=False,
-        )
-        return _eikonal_iter_chunk_compiled
-    except Exception:
-        _eikonal_iter_chunk_compiled = _eikonal_iter_chunk
-        return _eikonal_iter_chunk_compiled
-
-
 def _eikonal_soft_sweeping_diff(
     cost: torch.Tensor,
     src_mask: torch.Tensor,
     cfg: "EikonalConfig",
     checkpoint_chunk: int = 10,
     gate_alpha: float = 1.0,
-    use_compile: bool = False,
 ) -> torch.Tensor:
     """
     Differentiable Eikonal soft sweeping with gradient checkpointing.
@@ -935,7 +945,6 @@ def _eikonal_soft_sweeping_diff(
         checkpoint_chunk: recompute every N iterations during backward pass
         gate_alpha:       GPPN-style residual gate (1.0 = no gating, <1.0 = blend
                           with previous T for smoother gradient flow)
-        use_compile:      if True, use torch.compile on the inner iteration kernel
     """
     squeeze_back = cost.dim() == 2
     if squeeze_back:
@@ -975,11 +984,10 @@ def _eikonal_soft_sweeping_diff(
 
     n_iters = int(cfg.n_iters)
     chunk   = max(1, int(checkpoint_chunk))
-    _iter_fn = _get_compiled_eikonal_iter_chunk() if use_compile else _eikonal_iter_chunk
 
     def _make_fn(nc):
         def fn(T_in, cost_in, src_m, even_m, odd_m):
-            return _iter_fn(
+            return _eikonal_iter_chunk(
                 T_in, cost_in, src_m, even_m, odd_m,
                 h_val, large_val, tau_min, tau_branch, tau_update,
                 use_redblack, monotone, mode, nc, ga,
@@ -1009,7 +1017,6 @@ def _eikonal_soft_sweeping_diff_init(
     T_init: torch.Tensor,
     checkpoint_chunk: int = 10,
     gate_alpha: float = 1.0,
-    use_compile: bool = False,
 ) -> torch.Tensor:
     """[MOD] Differentiable Eikonal soft sweeping with a warm-start initial field.
 
@@ -1080,11 +1087,10 @@ def _eikonal_soft_sweeping_diff_init(
 
     n_iters = int(cfg.n_iters)
     chunk   = max(1, int(checkpoint_chunk))
-    _iter_fn = _get_compiled_eikonal_iter_chunk() if use_compile else _eikonal_iter_chunk
 
     def _make_fn(nc):
         def fn(T_in, cost_in, src_m, even_m, odd_m):
-            return _iter_fn(
+            return _eikonal_iter_chunk(
                 T_in, cost_in, src_m, even_m, odd_m,
                 h_val, large_val, tau_min, tau_branch, tau_update,
                 use_redblack, monotone, mode, nc, ga,
@@ -1216,6 +1222,20 @@ class SAMRoute(SAMRoad):
         self.route_tube_max_area_ratio = float(_cfg(config, "ROUTE_TUBE_MAX_AREA_RATIO", 0.90))
         self.route_tube_min_side       = int(_cfg(config,  "ROUTE_TUBE_MIN_SIDE",       16))
 
+        # --- Neural residual cost net (optional; adds spatial context to prob→cost) ---
+        self.route_cost_net             = bool(_cfg(config, "ROUTE_COST_NET", False))
+        self.route_cost_net_ch          = int(_cfg(config, "ROUTE_COST_NET_CH", 8))
+        self.route_cost_net_use_coord   = bool(_cfg(config, "ROUTE_COST_NET_USE_COORD", False))
+        # Bound the log-residual via tanh, then scale it (typical range 0.25~1.5)
+        self.route_cost_net_delta_scale = float(_cfg(config, "ROUTE_COST_NET_DELTA_SCALE", 0.75))
+
+        if self.route_cost_net:
+            in_ch = 1 + (2 if self.route_cost_net_use_coord else 0)
+            self.cost_net = ResidualCostNet(in_ch=in_ch, mid_ch=self.route_cost_net_ch)
+        else:
+            self.cost_net = None
+
+
         # Learnable Eikonal-Euclidean blending gate (residual form)
         _gate_init = float(_cfg(config, "ROUTE_EIK_GATE_INIT", 0.80))
         _gate_init = max(0.01, min(0.99, _gate_init))
@@ -1290,6 +1310,50 @@ class SAMRoute(SAMRoad):
         mask_scores = torch.sigmoid(mask_logits)
         return mask_logits.permute(0, 2, 3, 1), mask_scores.permute(0, 2, 3, 1)
 
+def _road_prob_to_cost(self, road_prob: torch.Tensor) -> torch.Tensor:
+    """
+    Differentiable prob → cost, dispatched by self.route_cost_mode.
+
+    Base mapping:
+      - "add" (default):  cost = 1 + alpha*(1-p)^gamma + block_alpha*sigmoid(...)
+        → T is in pixel units, directly comparable to GT path length.
+      - "exp" (original): cost = exp(log(offroad_penalty)*(1-p)^gamma) * sigmoid_amp
+        → steeper but harder to supervise with GT lengths.
+
+    Optional neural residual (if ROUTE_COST_NET=True):
+        delta_log = tanh(CNN(prob[, coords])) * delta_scale
+        cost = base_cost * exp(delta_log)
+    """
+    if self.route_cost_mode == "exp":
+        base_cost = _prob_to_cost_smooth(
+            road_prob,
+            gamma           = self.route_gamma,
+            offroad_penalty = self.route_offroad_penalty,
+            block_th        = self.route_block_th,
+            block_smooth    = self.route_block_smooth,
+            eps             = self.route_eps,
+        )
+    else:
+        # default: "add" — alpha/gamma are learnable (log-space + clamp)
+        alpha = self.cost_log_alpha.clamp(
+            _math.log(5.0), _math.log(100.0)).exp()
+        gamma = self.cost_log_gamma.clamp(
+            _math.log(0.5), _math.log(4.0)).exp()
+        base_cost = _prob_to_cost_additive(
+            road_prob,
+            alpha        = alpha,
+            gamma        = gamma,
+            block_th     = self.route_block_th,
+            block_alpha  = self.route_add_block_alpha,
+            block_smooth = self.route_add_block_smooth,
+            eps          = self.route_eps,
+        )
+
+    delta_log = self._cost_net_delta_log(road_prob)
+    if delta_log is not None:
+        base_cost = base_cost * torch.exp(delta_log)
+
+    return base_cost
     def _road_prob_to_cost(self, road_prob: torch.Tensor) -> torch.Tensor:
         """
         Differentiable prob → cost, dispatched by self.route_cost_mode.
@@ -2422,19 +2486,16 @@ class SAMRoute(SAMRoad):
         try:
             self._last_tube_meta["iters_fine"] = int(actual_iters_fine)
             self._last_tube_meta["iters_coarse"] = int(actual_iters_coarse)
-            self._last_tube_meta["oob_count"] = 0
         except Exception:
             pass
 
         # -------------------------
         # Pass 5: read K targets (tube-offset-aware)
         # -------------------------
-        oob_count = 0
         all_dists: list = []
         for b in range(B):
             valid_mask = geom[b][6]
             T_b  = T_ref[b]
-            Href, Wref = T_b.shape[0], T_b.shape[1]
             yoff, xoff = off_f[b]
             dists_b = []
             for k in range(K):
@@ -2443,28 +2504,14 @@ class SAMRoute(SAMRoad):
                     if tf is None:
                         dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
                         continue
-                    ty = int(tf[0] - yoff)
-                    tx = int(tf[1] - xoff)
-                    if ty < 0 or ty >= Href or tx < 0 or tx >= Wref:
-                        oob_count += 1
-                        dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
-                        continue
+                    ty = tf[0] - yoff
+                    tx = tf[1] - xoff
+                    ty = max(0, min(int(ty), T_b.shape[0] - 1))
+                    tx = max(0, min(int(tx), T_b.shape[1] - 1))
                     dists_b.append(T_b[ty, tx])
                 else:
                     dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
             all_dists.append(torch.stack(dists_b))
-
-        if use_tube:
-            try:
-                self._last_tube_meta["oob_count"] = int(oob_count)
-            except Exception:
-                pass
-            if oob_count > 0:
-                import warnings
-                warnings.warn(
-                    f"[tube] {oob_count} target(s) fell outside tube bbox — "
-                    f"bbox construction may have an alignment bug"
-                )
 
         T_eik = torch.stack(all_dists)  # [B, K]
         d_euc = ((src_yx.unsqueeze(1).float() - tgt_yx_k.float()) ** 2).sum(-1).sqrt()  # [B, K]

@@ -96,8 +96,14 @@ class GradcheckConfig:
         self.ROUTE_BLOCK_TH = 0.0
         self.ROUTE_ROI_MARGIN = 64
 
+        # --- neural residual cost net (adds spatial context to prob→cost) ---
+        self.ROUTE_COST_NET = True
+        self.ROUTE_COST_NET_CH = 8
+        self.ROUTE_COST_NET_USE_COORD = False
+        self.ROUTE_COST_NET_DELTA_SCALE = 0.75
+
         # Eikonal params (CLI override)
-        self.ROUTE_EIK_ITERS = 200
+        self.ROUTE_EIK_ITERS = 40
         self.ROUTE_EIK_DOWNSAMPLE = 4
         self.ROUTE_CKPT_CHUNK = 10
         self.ROUTE_DIST_NORM_PX = 512.0
@@ -307,50 +313,6 @@ def _sample_pairs_from_npz(
     return src, tgt, gt_px
 
 
-def _prepare_all_node_pairs(
-    coords: np.ndarray,
-    udist: np.ndarray,
-    H: int,
-    W: int,
-    case_idx: int,
-    k_neighbors: int = 4,
-) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """For one TSP case, build (src_yx, tgt_yx_k, gt_dist_k) for every node as source.
-
-    Returns a list of tuples, one per valid source node:
-        src_yx   : (2,)  int64 pixel coords (y, x)
-        tgt_yx_k : (K,2) int64 pixel coords
-        gt_dist_k: (K,)  float32 GT distance in pixels
-    Nodes with fewer than *k_neighbors* valid neighbours are skipped.
-    """
-    xy_norm = coords[case_idx]           # (N, 2)  x_norm, y_norm (bottom-left)
-    N = xy_norm.shape[0]
-    yx = _normxy_to_yx(xy_norm, H, W)   # (N, 2)  y, x (top-left pixel)
-    dist_mat = udist[case_idx]           # (N, N)
-
-    pairs: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-    for i in range(N):
-        d_row = dist_mat[i]
-        valid = np.isfinite(d_row) & (d_row > 0)
-        valid[i] = False
-        idx = np.where(valid)[0]
-        if idx.size < k_neighbors:
-            continue
-        # K nearest by Euclidean distance on pixel grid
-        eu = np.sqrt((yx[idx, 0].astype(float) - yx[i, 0]) ** 2
-                     + (yx[idx, 1].astype(float) - yx[i, 1]) ** 2)
-        order = np.argsort(eu)
-        chosen = idx[order[:k_neighbors]]
-        gt_px = (d_row[chosen] * float(H)).astype(np.float32)
-
-        pairs.append((
-            yx[i].astype(np.int64),
-            yx[chosen].astype(np.int64),
-            gt_px,
-        ))
-    return pairs
-
-
 # -----------------------------------------------------------------------------
 # Full-grid multigrid(+tube) differentiable solve (no ROI padding explosion)
 # -----------------------------------------------------------------------------
@@ -410,14 +372,11 @@ def _backtrack_path_on_grid(
         neigh = []
         for yy in range(y0, y1 + 1):
             for xx in range(x0, x1 + 1):
-                if yy == y and xx == x:
-                    continue
                 neigh.append((float(T[yy, xx].item()), yy, xx))
-        if not neigh:
-            break
         neigh.sort(key=lambda t: t[0])
+        # take the smallest neighbor; if stuck (no decrease), break
         bestT, by, bx = neigh[0]
-        if bestT >= float(T[y, x].item()) + 1e-6:
+        if bestT > float(T[y, x].item()) + 1e-6:
             break
         y, x = by, bx
         path.append((y, x))
@@ -491,8 +450,7 @@ def fullgrid_multigrid_diff_solve(
     # -------------------------
     # Coarse solve
     # -------------------------
-    actual_iters_coarse = int(max(mg_iters_coarse, int(max(Hc, Wc) * 1.5)))
-    cfg_c = dc_replace(cfg, h=float(ds_coarse), n_iters=actual_iters_coarse, monotone=True)
+    cfg_c = dc_replace(cfg, h=float(ds_coarse), n_iters=int(mg_iters_coarse), monotone=False)
     T_c = _eikonal_soft_sweeping_diff(
         cost_c,
         src_mask_c,
@@ -598,15 +556,18 @@ def fullgrid_multigrid_diff_solve(
                 "y0f": y0f, "x0f": x0f,
             })
 
+    # store for debugging
+    try:
+        model._last_tube_meta = tube_meta
+    except Exception:
+        pass
+
     # -------------------------
     # Fine refinement
     # -------------------------
     P_for_floor = max(Hf, Wf) if tube_iters_floor_full else (max(cost_ref.shape[-2], cost_ref.shape[-1]))
     actual_iters_fine = int(max(mg_iters_fine, int(P_for_floor * 0.8)))
     cfg_f = dc_replace(cfg, h=float(ds_common), n_iters=actual_iters_fine, monotone=bool(fine_monotone))
-
-    tube_meta["iters_fine"] = actual_iters_fine
-    tube_meta["iters_coarse"] = actual_iters_coarse
 
     T_ref = _eikonal_soft_sweeping_diff_init(
         cost_ref,
@@ -620,243 +581,31 @@ def fullgrid_multigrid_diff_solve(
     # -------------------------
     # Read targets (tube-offset aware)
     # -------------------------
-    oob_count = 0
     T_eik = []
     for b in range(B):
         yoff, xoff = off_yx[b]
         Tb = T_ref[b]
-        Href, Wref = Tb.shape[0], Tb.shape[1]
         d_b = []
         for k in range(K):
             if bool((gt_dist_k[b, k] > 0).item()):
                 ty = int(tgt_c[b, k, 0].item()) - yoff
                 tx = int(tgt_c[b, k, 1].item()) - xoff
-                if ty < 0 or ty >= Href or tx < 0 or tx >= Wref:
-                    oob_count += 1
+                # Do NOT silently clamp (debug-friendly). If out-of-bounds, return large_val.
+                if ty < 0 or ty >= Tb.shape[0] or tx < 0 or tx >= Tb.shape[1]:
                     d_b.append(torch.tensor(large_val, device=device, dtype=Tb.dtype))
-                    continue
-                d_b.append(Tb[ty, tx])
+                else:
+                    d_b.append(Tb[ty, tx])
             else:
                 d_b.append(torch.tensor(large_val, device=device, dtype=Tb.dtype))
         T_eik.append(torch.stack(d_b))
     T_eik = torch.stack(T_eik, dim=0)  # [B,K]
 
-    if use_tube:
-        tube_meta["oob_count"] = oob_count
-        if oob_count > 0:
-            import warnings
-            warnings.warn(
-                f"[tube] {oob_count} target(s) fell outside tube bbox — "
-                f"bbox construction may have an alignment bug"
-            )
-
-    # store for debugging
-    try:
-        model._last_tube_meta = tube_meta
-    except Exception:
-        pass
-
     # Euclidean residual blending
+    # d_euc in pixel units (full-res)
     src_f = src_yx.float().unsqueeze(1)   # [B,1,2]
     tgt_f2 = tgt_yx_k.float()             # [B,K,2]
     d_euc = ((src_f - tgt_f2) ** 2).sum(-1).sqrt()  # [B,K]
     pred = _mix_eikonal_euclid(T_eik, d_euc, model.eik_gate_logit)
-    return pred
-
-
-def fullgrid_multigrid_diff_solve_batched(
-    model: SAMRoute,
-    cost_f: torch.Tensor,        # [1, Hf, Wf] precomputed fine cost
-    cost_c: torch.Tensor,        # [1, Hc, Wc] precomputed coarse cost
-    src_yx: torch.Tensor,        # [N, 2] pixel coords
-    tgt_yx_k: torch.Tensor,      # [N, K, 2]
-    gt_dist_k: torch.Tensor,     # [N, K] (<=0 means invalid)
-    cfg: EikonalConfig,
-    *,
-    ds_common: int,
-    mg_factor: int,
-    mg_iters_coarse: int,
-    mg_iters_fine: int,
-    mg_detach_coarse: bool,
-    mg_interp: str,
-    fine_monotone: bool,
-    use_compile: bool = False,
-    tube_roi: bool = False,
-    tube_radius_c: int = 8,
-    tube_pad_c: int = 4,
-    tube_max_area_ratio: float = 0.90,
-    tube_min_side: int = 16,
-    tube_min_Pc: int = 256,
-) -> torch.Tensor:
-    """Batched multigrid solve: N sources sharing the same precomputed cost map.
-
-    Unlike fullgrid_multigrid_diff_solve, this version:
-      - Accepts precomputed cost_f / cost_c (avoid recomputing per pair)
-      - Processes N source points in a single Eikonal solve (B=N)
-      - Optionally uses tube ROI via *union bbox* across all N sources' paths
-
-    Returns:
-        pred_dist: [N, K] in pixel units
-    """
-    device = cost_f.device
-    N = src_yx.shape[0]
-    K = tgt_yx_k.shape[1]
-    Hf, Wf = cost_f.shape[-2], cost_f.shape[-1]
-    Hc, Wc = cost_c.shape[-2], cost_c.shape[-1]
-    large_val = float(cfg.large_val)
-    ds_common = max(1, int(ds_common))
-    mg_factor = max(1, int(mg_factor))
-    ds_coarse = max(1, ds_common * mg_factor)
-
-    cost_c_n = cost_c.expand(N, -1, -1)
-
-    src_cc = (src_yx.long() // ds_coarse).clamp(min=0)
-    src_cc[:, 0] = src_cc[:, 0].clamp(0, Hc - 1)
-    src_cc[:, 1] = src_cc[:, 1].clamp(0, Wc - 1)
-    src_mask_c = _make_src_mask(N, Hc, Wc, src_cc, device)
-
-    src_fc = (src_yx.long() // ds_common).clamp(min=0)
-    src_fc[:, 0] = src_fc[:, 0].clamp(0, Hf - 1)
-    src_fc[:, 1] = src_fc[:, 1].clamp(0, Wf - 1)
-
-    tgt_c = (tgt_yx_k.long() // ds_common).clamp(min=0)
-    tgt_c[..., 0] = tgt_c[..., 0].clamp(0, Hf - 1)
-    tgt_c[..., 1] = tgt_c[..., 1].clamp(0, Wf - 1)
-
-    # --- Coarse solve (always full grid, batched) ---
-    actual_iters_coarse = int(max(mg_iters_coarse, int(max(Hc, Wc) * 1.5)))
-    cfg_c = dc_replace(cfg, h=float(ds_coarse), n_iters=actual_iters_coarse, monotone=True)
-    T_c = _eikonal_soft_sweeping_diff(
-        cost_c_n, src_mask_c, cfg_c,
-        checkpoint_chunk=int(getattr(model, "route_ckpt_chunk", 10)),
-        gate_alpha=float(getattr(model, "route_gate_alpha", 1.0)),
-        use_compile=use_compile,
-    )
-    if mg_detach_coarse:
-        T_c = T_c.detach()
-
-    # --- Warm-start upsample ---
-    if mg_interp == "nearest":
-        T_init = F.interpolate(T_c.unsqueeze(1), size=(Hf, Wf), mode="nearest").squeeze(1)
-    else:
-        T_init = F.interpolate(
-            T_c.unsqueeze(1), size=(Hf, Wf), mode="bilinear", align_corners=False,
-        ).squeeze(1)
-    T_init = T_init.clamp_min(0.0).clamp_max(large_val)
-    src_mask_f = _make_src_mask(N, Hf, Wf, src_fc, device)
-    T_init = torch.where(src_mask_f, torch.zeros_like(T_init), T_init)
-
-    # --- Optional tube ROI: union bbox across all N sources ---
-    use_tube = bool(tube_roi) and (max(Hf, Wf) >= int(tube_min_Pc))
-    y0f, x0f = 0, 0
-    cost_ref = cost_f.expand(N, -1, -1)
-    src_ref = src_mask_f
-    T_init_ref = T_init
-
-    tube_meta: Dict[str, Any] = {
-        "use_tube": False, "Hf": Hf, "Wf": Wf, "ds": ds_common,
-        "batched_N": N,
-    }
-
-    if use_tube:
-        tgt_cc = (tgt_yx_k.long() // ds_coarse).clamp(min=0)
-        tgt_cc[..., 0] = tgt_cc[..., 0].clamp(0, Hc - 1)
-        tgt_cc[..., 1] = tgt_cc[..., 1].clamp(0, Wc - 1)
-
-        T_c_cpu = T_c.detach().cpu()
-        all_path_ys: List[int] = []
-        all_path_xs: List[int] = []
-        for b in range(N):
-            sy = int(src_cc[b, 0].item())
-            sx = int(src_cc[b, 1].item())
-            all_path_ys.append(sy)
-            all_path_xs.append(sx)
-            for k in range(K):
-                if gt_dist_k[b, k].item() <= 0:
-                    continue
-                ty = int(tgt_cc[b, k, 0].item())
-                tx = int(tgt_cc[b, k, 1].item())
-                path = _backtrack_path_on_grid(
-                    T_c_cpu[b], (sy, sx), (ty, tx), max_steps=Hc * Wc,
-                )
-                for py, px in path:
-                    all_path_ys.append(py)
-                    all_path_xs.append(px)
-
-        if all_path_ys:
-            rc = int(tube_radius_c)
-            pc = int(tube_pad_c)
-            y0c = max(0, min(all_path_ys) - rc - pc)
-            y1c = min(Hc, max(all_path_ys) + rc + pc + 1)
-            x0c = max(0, min(all_path_xs) - rc - pc)
-            x1c = min(Wc, max(all_path_xs) + rc + pc + 1)
-
-            y0f = max(0, y0c * mg_factor)
-            x0f = max(0, x0c * mg_factor)
-            y1f = min(Hf, max(y0f + int(tube_min_side), y1c * mg_factor))
-            x1f = min(Wf, max(x0f + int(tube_min_side), x1c * mg_factor))
-
-            tube_h = y1f - y0f
-            tube_w = x1f - x0f
-            area_ratio = float(tube_h * tube_w) / float(Hf * Wf + 1e-9)
-
-            if area_ratio < float(tube_max_area_ratio):
-                cost_ref = cost_f[:, y0f:y1f, x0f:x1f].expand(N, -1, -1)
-                src_ref = src_mask_f[:, y0f:y1f, x0f:x1f].clone()
-                T_init_ref = T_init[:, y0f:y1f, x0f:x1f]
-                use_tube = True
-                tube_meta.update({
-                    "use_tube": True,
-                    "tube_h": tube_h, "tube_w": tube_w,
-                    "tube_area_ratio": area_ratio,
-                    "y0f": y0f, "x0f": x0f,
-                })
-            else:
-                use_tube = False
-
-    # --- Fine refinement ---
-    Hrf, Wrf = cost_ref.shape[-2], cost_ref.shape[-1]
-    actual_iters_fine = int(max(mg_iters_fine, int(max(Hrf, Wrf) * 0.8)))
-    cfg_f = dc_replace(cfg, h=float(ds_common), n_iters=actual_iters_fine, monotone=bool(fine_monotone))
-    T_ref = _eikonal_soft_sweeping_diff_init(
-        cost_ref, src_ref, cfg_f, T_init_ref,
-        checkpoint_chunk=int(getattr(model, "route_ckpt_chunk", 10)),
-        gate_alpha=float(getattr(model, "route_gate_alpha", 1.0)),
-        use_compile=use_compile,
-    )
-
-    # --- Read target distances (tube-offset aware) ---
-    oob_count = 0
-    b_idx = torch.arange(N, device=device).unsqueeze(1).expand(-1, K)
-    if use_tube:
-        ty_local = tgt_c[..., 0] - y0f
-        tx_local = tgt_c[..., 1] - x0f
-        oob = (ty_local < 0) | (ty_local >= Hrf) | (tx_local < 0) | (tx_local >= Wrf)
-        oob_count = int(oob.sum().item())
-        ty_local = ty_local.clamp(0, Hrf - 1)
-        tx_local = tx_local.clamp(0, Wrf - 1)
-        T_eik = T_ref[b_idx, ty_local, tx_local]
-        T_eik = torch.where(oob, torch.full_like(T_eik, large_val), T_eik)
-    else:
-        T_eik = T_ref[b_idx, tgt_c[..., 0], tgt_c[..., 1]]
-
-    invalid = gt_dist_k <= 0
-    T_eik = torch.where(invalid, torch.full_like(T_eik, large_val), T_eik)
-
-    # --- Euclidean blending ---
-    src_f = src_yx.float().unsqueeze(1)
-    tgt_f2 = tgt_yx_k.float()
-    d_euc = ((src_f - tgt_f2) ** 2).sum(-1).sqrt()
-    pred = _mix_eikonal_euclid(T_eik, d_euc, model.eik_gate_logit)
-
-    tube_meta["iters_fine"] = actual_iters_fine
-    tube_meta["iters_coarse"] = actual_iters_coarse
-    tube_meta["oob_count"] = oob_count
-    try:
-        model._last_tube_meta = tube_meta
-    except Exception:
-        pass
-
     return pred
 
 
@@ -928,30 +677,40 @@ def _apply_cap(
     cap_mode: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     cap = norm * float(cap_mult)
-    cap_mode = str(cap_mode).lower()
-
-    if cap_mode == "log":
-        pred_in = torch.log1p(pred_dist / norm)
-        gt_in = torch.log1p(gt_dist / norm)
-        sat = torch.zeros_like(pred_dist, dtype=torch.bool)
-        return pred_in, gt_in, sat
-
-    if cap_mode == "none":
-        pred_c = pred_dist
-        sat = torch.zeros_like(pred_dist, dtype=torch.bool)
-    elif cap_mode == "tanh":
+    if cap_mode == "tanh":
         pred_c = cap * torch.tanh(pred_dist / cap)
         sat = pred_dist > cap
-    else:
+    elif cap_mode == "clamp":
         pred_c = pred_dist.clamp(max=cap)
         sat = pred_dist > cap
-
+    elif cap_mode == "log":
+        pred_c = torch.log1p(pred_dist / max(1e-6, norm)) * norm
+        sat = torch.zeros_like(pred_dist, dtype=torch.bool)
+    else:
+        pred_c = pred_dist
+        sat = torch.zeros_like(pred_dist, dtype=torch.bool)
     return pred_c / norm, gt_dist / norm, sat
 
 
 # -----------------------------------------------------------------------------
 # Visualization (optional): overlay path on full image
 # -----------------------------------------------------------------------------
+
+def _tv_l1(x: torch.Tensor) -> torch.Tensor:
+    """Total variation (L1) on a [B,H,W] tensor."""
+    if x.numel() == 0:
+        return x.sum() * 0.0
+    dx = (x[..., 1:] - x[..., :-1]).abs().mean()
+    dy = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
+    return dx + dy
+
+
+def _residual_reg(delta_log: torch.Tensor) -> torch.Tensor:
+    """Prevent 'global cheating': encourage small, zero-mean residual."""
+    if delta_log.numel() == 0:
+        return delta_log.sum() * 0.0
+    return (delta_log ** 2).mean() + (delta_log.mean() ** 2)
+
 def _save_route_overlay(
     out_path: str,
     rgb: np.ndarray,            # [H,W,3] uint8
@@ -1017,389 +776,6 @@ def _hard_eval_route_fullgrid(
 
 
 # -----------------------------------------------------------------------------
-# TSP multi-anchor training & evaluation
-# -----------------------------------------------------------------------------
-
-def _tsp_evaluate(
-    model: SAMRoute,
-    road_prob_t: torch.Tensor,
-    coords: np.ndarray,
-    udist: np.ndarray,
-    H: int,
-    W: int,
-    case_indices: List[int],
-    args,
-    cfg,
-    device: torch.device,
-    tag: str = "eval",
-) -> Dict[str, float]:
-    """Evaluate model distance predictions over multiple TSP cases (no_grad).
-
-    Returns dict with aggregate metrics.
-    """
-    model.eval()
-    K = int(args.tsp_k_neighbors)
-    norm = float(getattr(cfg, "ROUTE_DIST_NORM_PX", 512.0))
-    eps = float(args.prob_eps)
-
-    mg_itc = int(args.mg_iters_coarse) if int(args.mg_iters_coarse) > 0 else max(20, int(args.eik_iters * 0.25))
-    mg_itf = int(args.mg_iters_fine)   if int(args.mg_iters_fine)   > 0 else max(20, int(args.eik_iters * 0.80))
-
-    all_mae: List[float] = []
-    all_rel: List[float] = []
-    all_gt:  List[float] = []
-    n_oob_total = 0
-
-    rp_in = road_prob_t.clamp(eps, 1.0 - eps)
-
-    ds = int(args.downsample)
-    if args.multigrid:
-        mg_f = int(args.mg_factor)
-        ds_coarse = ds * mg_f
-        prob_f, _, _ = _maxpool_prob(rp_in, ds)
-        Hf, Wf = prob_f.shape[-2], prob_f.shape[-1]
-        cost_f = model._road_prob_to_cost(prob_f).to(dtype=torch.float32)
-        prob_c, _, _ = _maxpool_prob(rp_in, ds_coarse)
-        cost_c = model._road_prob_to_cost(prob_c).to(dtype=torch.float32)
-    else:
-        prob_f, _, _ = _maxpool_prob(rp_in, ds)
-        Hf, Wf = prob_f.shape[-2], prob_f.shape[-1]
-        cost_f = model._road_prob_to_cost(prob_f).to(dtype=torch.float32)
-
-    for ci_pos, ci in enumerate(case_indices):
-        pairs = _prepare_all_node_pairs(coords, udist, H, W, ci, K)
-        if not pairs:
-            if (ci_pos + 1) % max(1, args.tsp_log_interval) == 0:
-                print(f"  [{tag}] {ci_pos+1}/{len(case_indices)} cases done ...")
-            continue
-
-        N_p = len(pairs)
-        src_all = torch.from_numpy(np.stack([p[0] for p in pairs])).to(device, torch.long)
-        tgt_all = torch.from_numpy(np.stack([p[1] for p in pairs])).to(device, torch.long)
-        gt_all_np = np.stack([p[2] for p in pairs])
-        gt_t = torch.from_numpy(gt_all_np).to(device, torch.float32)
-
-        if args.multigrid:
-            pred = fullgrid_multigrid_diff_solve_batched(
-                model, cost_f, cost_c, src_all, tgt_all, gt_t, model.route_eik_cfg,
-                ds_common=ds, mg_factor=mg_f,
-                mg_iters_coarse=mg_itc, mg_iters_fine=mg_itf,
-                mg_detach_coarse=True, mg_interp=str(args.mg_interp),
-                fine_monotone=bool(args.mg_fine_monotone),
-                use_compile=bool(getattr(args, "compile_eikonal", False)),
-                tube_roi=bool(args.tube_roi),
-                tube_radius_c=int(args.tube_radius_c),
-                tube_pad_c=int(args.tube_pad_c),
-                tube_max_area_ratio=float(args.tube_max_area_ratio),
-                tube_min_side=int(args.tube_min_side),
-                tube_min_Pc=int(args.tube_min_pc),
-            )
-        else:
-            cost_n = cost_f.expand(N_p, -1, -1)
-            src_c = (src_all // ds).clamp(0, max(Hf - 1, 0))
-            src_mask = _make_src_mask(N_p, Hf, Wf, src_c, device)
-            cfg_f = dc_replace(model.route_eik_cfg, h=float(ds), n_iters=int(args.eik_iters))
-            T = _eikonal_soft_sweeping_diff(
-                cost_n, src_mask, cfg_f,
-                checkpoint_chunk=int(getattr(model, "route_ckpt_chunk", 10)),
-                gate_alpha=float(getattr(model, "route_gate_alpha", 1.0)),
-            )
-            tgt_c = (tgt_all // ds).clamp(min=0)
-            tgt_c[..., 0] = tgt_c[..., 0].clamp(0, Hf - 1)
-            tgt_c[..., 1] = tgt_c[..., 1].clamp(0, Wf - 1)
-            b_idx = torch.arange(N_p, device=device).unsqueeze(1).expand(-1, K)
-            Te = T[b_idx, tgt_c[..., 0], tgt_c[..., 1]]
-            d_euc = ((src_all.float().unsqueeze(1) - tgt_all.float()) ** 2).sum(-1).sqrt()
-            pred = _mix_eikonal_euclid(Te, d_euc, model.eik_gate_logit)
-
-        pred_np = pred.detach().cpu().numpy()
-        valid = gt_all_np > 0
-        if valid.any():
-            err = np.abs(pred_np[valid] - gt_all_np[valid])
-            rel = err / np.maximum(gt_all_np[valid], 1.0)
-            all_mae.extend(err.tolist())
-            all_rel.extend(rel.tolist())
-            all_gt.extend(gt_all_np[valid].tolist())
-
-        meta = getattr(model, "_last_tube_meta", {})
-        n_oob_total += int(meta.get("oob_count", 0))
-
-        if (ci_pos + 1) % max(1, args.tsp_log_interval) == 0:
-            print(f"  [{tag}] {ci_pos+1}/{len(case_indices)} cases done ...")
-
-    if not all_mae:
-        print(f"  [{tag}] WARNING: no valid predictions!")
-        return {}
-
-    mae_arr = np.array(all_mae)
-    rel_arr = np.array(all_rel)
-    gt_arr  = np.array(all_gt)
-
-    # per-distance-bin breakdown
-    bins = {"short(<500px)": gt_arr < 500,
-            "medium(500-2000px)": (gt_arr >= 500) & (gt_arr < 2000),
-            "long(>2000px)": gt_arr >= 2000}
-
-    results: Dict[str, float] = {
-        "n_pairs": len(mae_arr),
-        "mae_mean": float(np.mean(mae_arr)),
-        "mae_median": float(np.median(mae_arr)),
-        "mae_p90": float(np.percentile(mae_arr, 90)),
-        "rel_mean": float(np.mean(rel_arr)),
-        "rel_median": float(np.median(rel_arr)),
-        "oob_total": n_oob_total,
-    }
-    for bname, bmask in bins.items():
-        if bmask.any():
-            results[f"mae_{bname}"] = float(np.mean(mae_arr[bmask]))
-            results[f"rel_{bname}"] = float(np.mean(rel_arr[bmask]))
-            results[f"n_{bname}"] = int(bmask.sum())
-
-    print(f"\n  [{tag}] ====== Evaluation Summary ({len(case_indices)} cases, {len(mae_arr)} pairs) ======")
-    print(f"    MAE  : mean={results['mae_mean']:.1f}px  median={results['mae_median']:.1f}px  p90={results['mae_p90']:.1f}px")
-    print(f"    RelErr: mean={results['rel_mean']:.4f}  median={results['rel_median']:.4f}")
-    for bname in bins:
-        if f"mae_{bname}" in results:
-            print(f"    {bname:>20s}: n={results[f'n_{bname}']:5d}  MAE={results[f'mae_{bname}']:.1f}px  RelErr={results[f'rel_{bname}']:.4f}")
-    if n_oob_total > 0:
-        print(f"    OOB targets: {n_oob_total}")
-    print()
-
-    return results
-
-
-def _run_tsp_train(
-    model: SAMRoute,
-    road_prob_np: np.ndarray,
-    rgb: np.ndarray,
-    cfg,
-    args,
-    device: torch.device,
-):
-    """TSP multi-anchor training: iterate over NPZ cases, train on distance loss."""
-    print("\n[mode] TSP multi-anchor training")
-
-    H, W = road_prob_np.shape[:2]
-    eps = float(args.prob_eps)
-
-    # --- load NPZ ---
-    npz_path = args.npz
-    if not npz_path:
-        tif_name = os.path.basename(args.tif)
-        location_key = tif_name.replace("crop_", "").replace("_z16.tif", "").replace(".tif", "")
-        npz_name = f"distance_dataset_all_{location_key}_p{int(args.p_count)}.npz"
-        npz_path = os.path.join(os.path.dirname(args.tif), npz_name)
-    if not os.path.isfile(npz_path):
-        raise FileNotFoundError(f"NPZ not found: {npz_path}")
-
-    coords, udist, H_npz, W_npz = _load_npz_nodes(npz_path)
-    N_cases = coords.shape[0]
-    print(f"[npz] {npz_path}  cases={N_cases}  nodes_per_case={coords.shape[1]}  H={H_npz} W={W_npz}")
-    if H_npz != H or W_npz != W:
-        print(f"  [warn] NPZ meta H/W={H_npz}/{W_npz} != tif H/W={H}/{W}")
-
-    # --- split train / eval ---
-    rng = np.random.RandomState(args.seed)
-    all_indices = rng.permutation(N_cases).tolist()
-
-    n_train = min(int(args.tsp_n_train), N_cases)
-    n_eval  = int(args.tsp_n_eval) if int(args.tsp_n_eval) > 0 else N_cases
-    n_eval  = min(n_eval, N_cases)
-
-    train_cases = all_indices[:n_train]
-    # eval from the end to avoid overlap when possible
-    eval_cases  = all_indices[n_train:n_train + n_eval] if (n_train + n_eval <= N_cases) else all_indices[:n_eval]
-    print(f"[split] train={len(train_cases)} cases  eval={len(eval_cases)} cases  "
-          f"overlap={len(set(train_cases) & set(eval_cases))}")
-
-    # --- build road_prob tensor ---
-    road_prob_t = torch.from_numpy(road_prob_np).to(device=device, dtype=torch.float32).unsqueeze(0)  # [1,H,W]
-    road_prob_t = road_prob_t.clamp(eps, 1.0 - eps)
-
-    # --- optimizer ---
-    model.train()
-    if args.freeze_encoder:
-        for p in model.image_encoder.parameters():
-            p.requires_grad = False
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=float(args.lr))
-    print(f"Trainable params: {sum(p.numel() for p in params)}")
-
-    with torch.no_grad():
-        _a = model.cost_log_alpha.clamp(math.log(5.0), math.log(100.0)).exp()
-        _g = model.cost_log_gamma.clamp(math.log(0.5), math.log(4.0)).exp()
-        _gate = torch.sigmoid(model.eik_gate_logit).clamp(0.3, 0.95)
-        print(f"[init] cost_alpha={_a.item():.3f}  cost_gamma={_g.item():.3f}  "
-              f"eik_gate={_gate.item():.4f}")
-
-    K = int(args.tsp_k_neighbors)
-    norm = float(getattr(cfg, "ROUTE_DIST_NORM_PX", 512.0))
-    mg_itc = int(args.mg_iters_coarse) if int(args.mg_iters_coarse) > 0 else max(20, int(args.eik_iters * 0.25))
-    mg_itf = int(args.mg_iters_fine)   if int(args.mg_iters_fine)   > 0 else max(20, int(args.eik_iters * 0.80))
-    out_dir = args.save_debug or "/tmp/route_tsp_train"
-    os.makedirs(out_dir, exist_ok=True)
-
-    # --- optional baseline eval ---
-    baseline_metrics: Dict[str, float] = {}
-    if args.tsp_eval_before:
-        print("\n===== Baseline Evaluation (before training) =====")
-        with torch.no_grad():
-            baseline_metrics = _tsp_evaluate(
-                model, road_prob_t, coords, udist, H, W,
-                eval_cases, args, cfg, device, tag="baseline",
-            )
-
-    # --- training loop ---
-    print(f"\n===== TSP Training: {len(train_cases)} cases x {args.tsp_epochs} epochs =====")
-    rp_in = road_prob_t.clamp(eps, 1.0 - eps)
-
-    ds = int(args.downsample)
-    mg_f = int(args.mg_factor)
-    ds_coarse_t = ds * mg_f
-    with torch.no_grad():
-        prob_f_cached, _, _ = _maxpool_prob(rp_in, ds)
-        Hf_cached, Wf_cached = prob_f_cached.shape[-2], prob_f_cached.shape[-1]
-        if args.multigrid:
-            prob_c_cached, _, _ = _maxpool_prob(rp_in, ds_coarse_t)
-
-    for epoch in range(int(args.tsp_epochs)):
-        epoch_losses: List[float] = []
-        epoch_maes:   List[float] = []
-        t_epoch_start = time.perf_counter()
-
-        case_order = train_cases.copy()
-        rng.shuffle(case_order)
-
-        for ci_pos, ci in enumerate(case_order):
-            opt.zero_grad(set_to_none=True)
-            pairs = _prepare_all_node_pairs(coords, udist, H, W, ci, K)
-            if not pairs:
-                continue
-
-            n_pairs = len(pairs)
-            model.train()
-
-            src_all = torch.from_numpy(np.stack([p[0] for p in pairs])).to(device, torch.long)
-            tgt_all = torch.from_numpy(np.stack([p[1] for p in pairs])).to(device, torch.long)
-            gt_all_np = np.stack([p[2] for p in pairs])
-            gt_t = torch.from_numpy(gt_all_np).to(device, torch.float32)
-
-            if args.multigrid:
-                cost_f = model._road_prob_to_cost(prob_f_cached).to(dtype=torch.float32)
-                cost_c = model._road_prob_to_cost(prob_c_cached).to(dtype=torch.float32)
-                pred = fullgrid_multigrid_diff_solve_batched(
-                    model, cost_f, cost_c, src_all, tgt_all, gt_t, model.route_eik_cfg,
-                    ds_common=ds, mg_factor=mg_f,
-                    mg_iters_coarse=mg_itc, mg_iters_fine=mg_itf,
-                    mg_detach_coarse=bool(args.mg_detach_coarse),
-                    mg_interp=str(args.mg_interp),
-                    fine_monotone=bool(args.mg_fine_monotone),
-                    use_compile=bool(getattr(args, "compile_eikonal", False)),
-                    tube_roi=bool(args.tube_roi),
-                    tube_radius_c=int(args.tube_radius_c),
-                    tube_pad_c=int(args.tube_pad_c),
-                    tube_max_area_ratio=float(args.tube_max_area_ratio),
-                    tube_min_side=int(args.tube_min_side),
-                    tube_min_Pc=int(args.tube_min_pc),
-                )
-            else:
-                cost_f = model._road_prob_to_cost(prob_f_cached).to(dtype=torch.float32)
-                cost_n = cost_f.expand(n_pairs, -1, -1)
-                src_c = (src_all // ds).clamp(0, max(Hf_cached - 1, 0))
-                src_mask = _make_src_mask(n_pairs, Hf_cached, Wf_cached, src_c, device)
-                cfg_f = dc_replace(model.route_eik_cfg, h=float(ds), n_iters=int(args.eik_iters))
-                T = _eikonal_soft_sweeping_diff(
-                    cost_n, src_mask, cfg_f,
-                    checkpoint_chunk=int(getattr(model, "route_ckpt_chunk", 10)),
-                    gate_alpha=float(getattr(model, "route_gate_alpha", 1.0)),
-                )
-                tgt_c = (tgt_all // ds).clamp(min=0)
-                tgt_c[..., 0] = tgt_c[..., 0].clamp(0, Hf_cached - 1)
-                tgt_c[..., 1] = tgt_c[..., 1].clamp(0, Wf_cached - 1)
-                b_idx = torch.arange(n_pairs, device=device).unsqueeze(1).expand(-1, K)
-                Te = T[b_idx, tgt_c[..., 0], tgt_c[..., 1]]
-                d_euc = ((src_all.float().unsqueeze(1) - tgt_all.float()) ** 2).sum(-1).sqrt()
-                pred = _mix_eikonal_euclid(Te, d_euc, model.eik_gate_logit)
-
-            valid = gt_t > 0
-            n_valid_nodes = 0
-            if valid.any():
-                pred_in, gt_in, _sat = _apply_cap(pred, gt_t, norm, args.cap_mult, args.cap_mode)
-                loss_case = model.dist_criterion(pred_in[valid], gt_in[valid])
-                loss_case.backward()
-                with torch.no_grad():
-                    case_mae = float((pred[valid] - gt_t[valid]).abs().mean().item())
-                epoch_losses.append(float(loss_case.item()))
-                epoch_maes.append(case_mae)
-                n_valid_nodes = 1
-
-            # gradient guard
-            has_bad = False
-            for p in params:
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    has_bad = True
-                    break
-            if has_bad:
-                print(f"  [epoch {epoch}] case {ci}: NaN/Inf gradient — skipping step")
-            else:
-                opt.step()
-
-            if (ci_pos + 1) % max(1, args.tsp_log_interval) == 0:
-                recent_loss = np.mean(epoch_losses[-args.tsp_log_interval:]) if epoch_losses else 0
-                recent_mae  = np.mean(epoch_maes[-args.tsp_log_interval:]) if epoch_maes else 0
-                print(f"  [epoch {epoch}] {ci_pos+1}/{len(case_order)} cases  "
-                      f"recent_loss={recent_loss:.6f}  recent_MAE={recent_mae:.1f}px")
-
-        t_epoch = time.perf_counter() - t_epoch_start
-        mean_loss = float(np.mean(epoch_losses)) if epoch_losses else 0
-        mean_mae  = float(np.mean(epoch_maes)) if epoch_maes else 0
-        with torch.no_grad():
-            _a = model.cost_log_alpha.clamp(math.log(5.0), math.log(100.0)).exp()
-            _g = model.cost_log_gamma.clamp(math.log(0.5), math.log(4.0)).exp()
-            _gate = torch.sigmoid(model.eik_gate_logit).clamp(0.3, 0.95)
-        print(f"\n  [epoch {epoch}] DONE  time={t_epoch:.1f}s  avg_loss={mean_loss:.6f}  "
-              f"avg_MAE={mean_mae:.1f}px")
-        print(f"  [params] cost_alpha={_a.item():.3f}  cost_gamma={_g.item():.3f}  "
-              f"eik_gate={_gate.item():.4f}")
-
-    # --- final evaluation ---
-    print(f"\n===== Final Evaluation ({len(eval_cases)} cases) =====")
-    with torch.no_grad():
-        final_metrics = _tsp_evaluate(
-            model, road_prob_t, coords, udist, H, W,
-            eval_cases, args, cfg, device, tag="final",
-        )
-
-    # --- save checkpoint ---
-    if args.tsp_save_ckpt:
-        ckpt_dir = os.path.dirname(args.tsp_save_ckpt)
-        if ckpt_dir:
-            os.makedirs(ckpt_dir, exist_ok=True)
-        save_dict = {
-            "cost_log_alpha": model.cost_log_alpha.detach().cpu(),
-            "cost_log_gamma": model.cost_log_gamma.detach().cpu(),
-            "eik_gate_logit": model.eik_gate_logit.detach().cpu(),
-            "args": vars(args),
-            "final_metrics": final_metrics,
-        }
-        torch.save(save_dict, args.tsp_save_ckpt)
-        print(f"[saved] routing checkpoint: {args.tsp_save_ckpt}")
-
-    # --- save metrics summary ---
-    summary_path = os.path.join(out_dir, "tsp_metrics.txt")
-    with open(summary_path, "w") as f:
-        if baseline_metrics:
-            f.write("=== BASELINE ===\n")
-            for k, v in baseline_metrics.items():
-                f.write(f"  {k}: {v}\n")
-            f.write("\n")
-        f.write("=== AFTER TRAINING ===\n")
-        for k, v in final_metrics.items():
-            f.write(f"  {k}: {v}\n")
-    print(f"[saved] {summary_path}")
-
-
-# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main():
@@ -1412,23 +788,32 @@ def main():
     ap.add_argument("--save_debug", type=str, default="", help="output dir to save debug images")
 
     # solver / loss knobs
-    ap.add_argument("--eik_iters", type=int, default=200)
-    ap.add_argument("--downsample", type=int, default=48)
+    ap.add_argument("--eik_iters", type=int, default=80)
+    ap.add_argument("--downsample", type=int, default=4)
     ap.add_argument("--eik_mode", type=str, default="soft_train",
                     choices=["ste_train", "soft_train", "hard_eval"])
     ap.add_argument("--cap_mode", type=str, default="tanh", choices=["clamp", "tanh", "log", "none"])
     ap.add_argument("--cap_mult", type=float, default=10.0)
+
+    # --- neural cost net ---
+    ap.add_argument("--cost_net", dest="cost_net", action="store_true", help="Enable ResidualCostNet in prob→cost (default: on)")
+    ap.add_argument("--no_cost_net", dest="cost_net", action="store_false", help="Disable ResidualCostNet")
+    ap.set_defaults(cost_net=None)
+    ap.add_argument("--cost_net_ch", type=int, default=8, help="ResidualCostNet hidden channels")
+    ap.add_argument("--cost_net_use_coord", action="store_true", help="Append (y,x) coord channels to cost net input")
+    ap.add_argument("--cost_net_delta_scale", type=float, default=0.75, help="Scale of bounded log-residual (tanh*scale)")
+    ap.add_argument("--lambda_cost_reg", type=float, default=1e-3, help="L2/mean regularization weight on cost residual (prevents global cheating)")
+    ap.add_argument("--lambda_cost_tv", type=float, default=0.0, help="TV regularization weight on cost residual (optional smoothing)")
+    ap.add_argument("--reg_on_coarse", action="store_true", help="Also regularize coarse-grid residual (default: off)")
     ap.add_argument("--lambda_seg", type=float, default=0.0)
     ap.add_argument("--lambda_dist", type=float, default=1.0)
     ap.add_argument("--steps", type=int, default=1)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--freeze_encoder", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--freeze_encoder", action="store_true")
     ap.add_argument("--profile_time", action="store_true")
-    ap.add_argument("--gate_alpha", type=float, default=0.8,
-                    help="GPPN residual gate alpha (0.8 recommended for multigrid)")
 
     # multigrid / tube
-    ap.add_argument("--multigrid", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--multigrid", action="store_true")
     ap.add_argument("--mg_factor", type=int, default=4)
     ap.add_argument("--mg_iters_coarse", type=int, default=0)
     ap.add_argument("--mg_iters_fine", type=int, default=0)
@@ -1436,7 +821,7 @@ def main():
     ap.add_argument("--mg_interp", type=str, default="bilinear", choices=["nearest", "bilinear"])
     ap.add_argument("--mg_fine_monotone", action="store_true")
 
-    ap.add_argument("--tube_roi", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--tube_roi", action="store_true")
     ap.add_argument("--tube_min_pc", type=int, default=256)
     ap.add_argument("--tube_radius_c", type=int, default=8)
     ap.add_argument("--tube_pad_c", type=int, default=4)
@@ -1466,8 +851,8 @@ def main():
     ap.add_argument("--cache_prob", type=str, default="", help="Path to .npy for caching full road_prob")
     ap.add_argument("--src", type=str, default="", help="src 'y,x' in full image coordinates")
     ap.add_argument("--tgt", type=str, default="", help="tgt 'y,x' in full image coordinates (single target)")
-    ap.add_argument("--sample_from_npz", action=argparse.BooleanOptionalAction, default=True,
-                    help="Sample src + K targets from NPZ nodes instead of --src/--tgt")
+    ap.add_argument("--sample_from_npz", action="store_true",
+                    help="If set, sample src + K targets from NPZ nodes instead of --src/--tgt")
     ap.add_argument("--min_gt_dist_px", type=float, default=50.0)
 
     ap.add_argument("--teacher_hard_eval", action="store_true",
@@ -1481,29 +866,6 @@ def main():
     ap.add_argument("--optimize_prob", action="store_true",
                     help="Treat full road_prob as learnable variable (not the segmentation network) and optimize it.")
     ap.add_argument("--prob_eps", type=float, default=1e-6)
-
-    # --- TSP multi-anchor training ---
-    ap.add_argument("--tsp_train", action=argparse.BooleanOptionalAction, default=True,
-                    help="TSP multi-anchor training: iterate over NPZ cases, "
-                         "use all 20 nodes as src with K nearest neighbors as targets")
-    ap.add_argument("--tsp_n_train", type=int, default=50,
-                    help="Number of NPZ cases to train on")
-    ap.add_argument("--tsp_n_eval", type=int, default=100,
-                    help="Number of NPZ cases to evaluate on (0=all)")
-    ap.add_argument("--tsp_epochs", type=int, default=3,
-                    help="Number of training epochs over the selected cases")
-    ap.add_argument("--tsp_k_neighbors", type=int, default=4,
-                    help="Number of nearest neighbor targets per source node")
-    ap.add_argument("--tsp_eval_before", action=argparse.BooleanOptionalAction, default=True,
-                    help="Run evaluation before training to establish baseline metrics")
-    ap.add_argument("--tsp_log_interval", type=int, default=10,
-                    help="Print training progress every N cases")
-    ap.add_argument("--tsp_save_ckpt", type=str, default="",
-                    help="Path to save routing-branch checkpoint after TSP training")
-
-    # --- performance ---
-    ap.add_argument("--compile_eikonal", action="store_true",
-                    help="Use torch.compile on Eikonal iteration kernel (PyTorch 2.0+)")
 
     args = ap.parse_args()
 
@@ -1533,6 +895,13 @@ def main():
         cfg.PATCH_SIZE = ps
 
     # override knobs
+    # neural cost net overrides
+    if args.cost_net is not None:
+        cfg.ROUTE_COST_NET = bool(args.cost_net)
+    cfg.ROUTE_COST_NET_CH = int(args.cost_net_ch)
+    cfg.ROUTE_COST_NET_USE_COORD = bool(args.cost_net_use_coord)
+    cfg.ROUTE_COST_NET_DELTA_SCALE = float(args.cost_net_delta_scale)
+
     cfg.ROUTE_EIK_ITERS = int(args.eik_iters)
     cfg.ROUTE_EIK_DOWNSAMPLE = int(args.downsample)
     cfg.ROUTE_LAMBDA_SEG = float(args.lambda_seg)
@@ -1563,13 +932,6 @@ def main():
         model.route_eik_cfg = dc_replace(model.route_eik_cfg, mode=args.eik_mode)
         if args.eik_mode != old_mode:
             print(f"[mode] Eikonal mode: {old_mode} -> {args.eik_mode}")
-
-    # override gate_alpha if requested
-    if abs(args.gate_alpha - model.route_gate_alpha) > 1e-9:
-        print(f"[gate] route_gate_alpha: {model.route_gate_alpha} -> {args.gate_alpha}")
-        model.route_gate_alpha = float(args.gate_alpha)
-    else:
-        print(f"[gate] route_gate_alpha={model.route_gate_alpha} (default)")
 
     # ---- choose mode ----
     fullmap_mode = bool(args.tif)
@@ -1650,6 +1012,18 @@ def main():
                 max_pred = 0.0
 
             loss = cfg.ROUTE_LAMBDA_SEG * loss_seg + cfg.ROUTE_LAMBDA_DIST * loss_dist
+            # --- optional regularization on neural cost residual (prevents global scaling cheats) ---
+            loss_reg = torch.tensor(0.0, device=device)
+            if getattr(cfg, "ROUTE_COST_NET", False) and getattr(model, "cost_net", None) is not None:
+                ds = int(args.downsample)
+                prob_f, _, _ = _maxpool_prob(road_prob, ds)
+                delta_f = model._cost_net_delta_log(prob_f)
+                if delta_f is not None:
+                    loss_reg = loss_reg + float(args.lambda_cost_reg) * _residual_reg(delta_f)
+                    if float(args.lambda_cost_tv) > 0:
+                        loss_reg = loss_reg + float(args.lambda_cost_tv) * _tv_l1(delta_f)
+
+            loss = loss + loss_reg
             loss.backward()
             opt.step()
 
@@ -1687,18 +1061,9 @@ def main():
             verbose=True,
         )
         if args.cache_prob:
-            _d = os.path.dirname(args.cache_prob)
-            if _d:
-                os.makedirs(_d, exist_ok=True)
+            os.makedirs(os.path.dirname(args.cache_prob), exist_ok=True)
             np.save(args.cache_prob, road_prob_np)
             print(f"[cache] saved road_prob: {args.cache_prob}")
-
-    # =====================================================================
-    # TSP multi-anchor training mode
-    # =====================================================================
-    if args.tsp_train:
-        _run_tsp_train(model, road_prob_np, rgb, cfg, args, device)
-        return
 
     # 3) choose src/tgt + gt_dist
     npz_path = args.npz
@@ -1804,14 +1169,13 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     if args.vis_full_route:
-        with torch.no_grad():
-            d0, path0 = _hard_eval_route_fullgrid(
-                model, road_prob_t,
-                (int(src_yx_np[0]), int(src_yx_np[1])),
-                (int(tgt_yx_np[0, 0]), int(tgt_yx_np[0, 1])),
-                ds=int(args.vis_ds),
-                n_iters=int(args.vis_iters),
-            )
+        d0, path0 = _hard_eval_route_fullgrid(
+            model, road_prob_t,
+            (int(src_yx_np[0]), int(src_yx_np[1])),
+            (int(tgt_yx_np[0, 0]), int(tgt_yx_np[0, 1])),
+            ds=int(args.vis_ds),
+            n_iters=int(args.vis_iters),
+        )
         _save_route_overlay(
             os.path.join(out_dir, "route_before.png"),
             rgb, road_prob_np,
@@ -1903,6 +1267,25 @@ def main():
             max_pred = float(pred_dist.max().item())
 
         loss = float(args.lambda_dist) * loss_dist
+# --- optional regularization on neural cost residual (prevents global scaling cheats) ---
+loss_reg = torch.tensor(0.0, device=device)
+if getattr(cfg, "ROUTE_COST_NET", False) and getattr(model, "cost_net", None) is not None:
+    ds = int(args.downsample)
+    prob_f, _, _ = _maxpool_prob(rp_in, ds)
+    delta_f = model._cost_net_delta_log(prob_f)
+    if delta_f is not None:
+        loss_reg = loss_reg + float(args.lambda_cost_reg) * _residual_reg(delta_f)
+        if float(args.lambda_cost_tv) > 0:
+            loss_reg = loss_reg + float(args.lambda_cost_tv) * _tv_l1(delta_f)
+
+    if bool(args.reg_on_coarse) and bool(args.multigrid):
+        ds_c = int(args.downsample) * int(args.mg_factor)
+        prob_c, _, _ = _maxpool_prob(rp_in, ds_c)
+        delta_c = model._cost_net_delta_log(prob_c)
+        if delta_c is not None:
+            loss_reg = loss_reg + float(args.lambda_cost_reg) * _residual_reg(delta_c)
+
+        loss = loss + loss_reg
 
         if _use_cuda_sync:
             torch.cuda.synchronize()
@@ -1939,27 +1322,21 @@ def main():
             if args.multigrid and hasattr(model, "_last_tube_meta"):
                 meta = getattr(model, "_last_tube_meta", {})
                 if meta:
-                    oob = meta.get('oob_count', 0)
-                    oob_str = f"  oob={oob}" if oob > 0 else ""
                     print(f"  [tube_meta] use={meta.get('use_tube', False)}  "
-                          f"Hf={meta.get('Hf','?')}  Wf={meta.get('Wf','?')}  "
-                          f"tube={meta.get('tube_h','?')}x{meta.get('tube_w','?')}  "
-                          f"area_ratio={meta.get('tube_area_ratio', 1.0):.3f}  "
-                          f"iters_fine={meta.get('iters_fine', '?')}  "
-                          f"iters_coarse={meta.get('iters_coarse', '?')}{oob_str}")
+                          f"tube_area_ratio={meta.get('tube_area_ratio', 1.0):.3f}  "
+                          f"tube={meta.get('tube_h','?')}x{meta.get('tube_w','?')}")
 
     # 8) visualization after
     if args.vis_full_route:
         rp_vis = (road_prob_var.detach() if road_prob_var is not None else road_prob_t).clamp(eps, 1.0 - eps)
         road_prob_after = rp_vis[0].float().cpu().numpy()
-        with torch.no_grad():
-            d1, path1 = _hard_eval_route_fullgrid(
-                model, rp_vis,
-                (int(src_yx_np[0]), int(src_yx_np[1])),
-                (int(tgt_yx_np[0, 0]), int(tgt_yx_np[0, 1])),
-                ds=int(args.vis_ds),
-                n_iters=int(args.vis_iters),
-            )
+        d1, path1 = _hard_eval_route_fullgrid(
+            model, rp_vis,
+            (int(src_yx_np[0]), int(src_yx_np[1])),
+            (int(tgt_yx_np[0, 0]), int(tgt_yx_np[0, 1])),
+            ds=int(args.vis_ds),
+            n_iters=int(args.vis_iters),
+        )
         _save_route_overlay(
             os.path.join(out_dir, "route_after.png"),
             rgb, road_prob_after,
