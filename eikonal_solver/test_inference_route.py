@@ -3,181 +3,67 @@ SAM-Road inference on a single GeoTIFF.
 
 Modes
 -----
-center  : crop the central 512×512 patch and run a single forward pass.
+center  : crop the central 512x512 patch and run a single forward pass.
           Produces a 3-panel figure: satellite | probability mask | Eikonal field.
 
-sliding : slide a 512×512 window across the full image with configurable stride
+sliding : slide a 512x512 window across the full image with configurable stride
           (default 256 px = 50% overlap).  Overlapping predictions are blended
           with a Hanning (cosine) weight window so patch-boundary seams vanish.
-          Produces a 2-panel figure: full satellite | full probability map.
+          With --route (default ON), uses multigrid Eikonal to plan a path.
 
-Options
--------
---smooth_sigma  apply Gaussian post-processing to the probability map before
-                visualisation (sigma=0 = off).  Useful to further reduce the
-                16-px ViT token grid without retraining.
+The model loading, routing parameters and Eikonal solver are aligned with
+eval_ranking_accuracy.py so that visualised paths correspond to the same
+distance metric used for quantitative evaluation.
 """
 import argparse
-import torch
-import torch.nn.functional as F  # NEW: for ROI pooling/padding
+import math
+import os
+import sys
+
 import numpy as np
+import torch
+import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from PIL import Image
-import os
 import tifffile
-
-from model_multigrid import SAMRoute
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.normpath(os.path.join(_SCRIPT_DIR, ".."))
-# Path to the raw SAM ViT-B image-encoder weights.
-# SAMRoute loads this INTERNALLY in __init__ — do NOT pass it as --ckpt.
-_SAM_ENCODER_CKPT = os.path.normpath(
-    os.path.join(_PROJECT_ROOT, "sam_road_repo", "sam_ckpts", "sam_vit_b_01ec64.pth")
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from model_multigrid import (
+    SAMRoute,
+    _eikonal_soft_sweeping_diff,
+    _eikonal_soft_sweeping_diff_init,
 )
-# Keep the old alias so InferenceConfig.SAM_CKPT_PATH still works.
-_DEFAULT_SAM_CKPT = _SAM_ENCODER_CKPT
+from gradcheck_route_loss_v2_multigrid_fullmap import (
+    GradcheckConfig,
+    _load_lightning_ckpt,
+    _detect_smooth_decoder,
+    _detect_patch_size,
+    _load_rgb_from_tif,
+    _maxpool_prob,
+    _make_src_mask,
+    _mix_eikonal_euclid,
+    _load_npz_nodes,
+    _normxy_to_yx,
+    sliding_window_inference,
+    smooth_prob,
+)
+from dataclasses import replace as dc_replace
 
-# Path to the COMPLETE SAM-Road checkpoint (encoder + map_decoder).
-# This is the model to pass as --ckpt for inference.
-# Default: fine-tuned LoRA model from finetune_demo.
-# _SAMROAD_CKPT_DEFAULT = "checkpoints/cityscale_vitb_512_e10.ckpt"
-_SAMROAD_CKPT_DEFAULT = "training_outputs/finetune_demo/checkpoints/best_lora_pos8.0_dice0.5_thin4.0.ckpt"
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-class InferenceConfig:
-    def __init__(self):
-        self.SAM_VERSION = 'vit_b'
-        self.PATCH_SIZE = 512
-        self.NO_SAM = False
-        self.USE_SAM_DECODER = False
-        self.USE_SMOOTH_DECODER = False   # auto-detected from checkpoint shape in load_model()
-        self.ENCODER_LORA = False
-        self.FREEZE_ENCODER = True
-        self.FOCAL_LOSS = False
-        self.TOPONET_VERSION = 'default'
-        self.SAM_CKPT_PATH = _DEFAULT_SAM_CKPT
-        self.ROUTE_COST_MODE = 'add'
-        self.ROUTE_ADD_ALPHA = 20.0
-        self.ROUTE_ADD_GAMMA = 2.0
-        self.ROUTE_ADD_BLOCK_ALPHA = 0.0   # disable hard-block; let wavefront cross gaps
-        self.ROUTE_BLOCK_TH = 0.0
-        self.ROUTE_EIK_DOWNSAMPLE = 4
-        # use_roi=False solves on 512×512; diagonal ≈ 724 px → 512 iters ensures convergence
-        self.ROUTE_EIK_ITERS = 512
-        self.ROUTE_CKPT_CHUNK = 10
-        self.ROUTE_ROI_MARGIN = 64
-        self.LORA_RANK = 4
-
-    def get(self, key, default):
-        return getattr(self, key, default)
+_CKPT_DEFAULT = os.path.join(
+    _PROJECT_ROOT,
+    "training_outputs", "finetune_demo", "checkpoints",
+    "best_lora_pos8.0_dice0.5_thin4.0.ckpt",
+)
 
 
 # ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def _detect_smooth_decoder(state_dict: dict) -> bool:
-    """Return True if the checkpoint was saved with the smooth decoder variant.
-
-    The standard decoder ends with ConvTranspose2d(32→2), so
-        map_decoder.7.weight has shape [2, 32, 2, 2]  (out_ch first for ConvTranspose2d).
-    The smooth decoder ends with Conv2d(32→2), so
-        map_decoder.9.weight has shape [2, 32, 3, 3].
-    We detect by checking whether map_decoder.7.weight has 32 output channels
-    (i.e., the intermediate ConvTranspose2d(32→32) is present).
-    """
-    w = state_dict.get("map_decoder.7.weight")
-    if w is None:
-        return False
-    # ConvTranspose2d stores weights as [in_ch, out_ch/groups, kH, kW]
-    # Standard: map_decoder.7 = ConvTranspose2d(32→2)  → shape [32, 2, 2, 2]
-    # Smooth:   map_decoder.7 = ConvTranspose2d(32→32) → shape [32, 32, 2, 2]
-    return w.shape[1] == 32  # out_ch == 32 means it's the smooth variant
-
-
-def _detect_patch_size(state_dict: dict) -> "int | None":
-    """Infer the training patch size from the SAM image encoder's pos_embed.
-
-    SAM ViT encodes images with a stride-16 patch embed, so:
-        pos_embed shape = [1, H_tokens, W_tokens, D]
-        patch_size = H_tokens * 16
-
-    Returns None if the key is absent (e.g. pure-decoder checkpoint).
-    """
-    pe = state_dict.get("image_encoder.pos_embed")
-    if pe is None:
-        return None
-    # pe shape: [1, H_tokens, W_tokens, embed_dim]
-    return int(pe.shape[1]) * 16
-
-
-def load_model(ckpt_path: str, config: InferenceConfig, device) -> "SAMRoute":
-    """Build SAMRoute, auto-detect decoder variant and patch size, load checkpoint."""
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-
-    raw_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = raw_ckpt.get("state_dict", raw_ckpt)
-    clean_sd = {
-        (k[len("model."):] if k.startswith("model.") else k): v
-        for k, v in state_dict.items()
-    }
-
-    # Guard: raw SAM encoder weights (sam_vit_b_01ec64.pth) contain only
-    # image_encoder keys and NO map_decoder keys.  Passing them as the
-    # SAM-Road checkpoint leaves the decoder randomly initialised, which
-    # produces a uniform ~0.5 probability map (solid pink in magma colormap).
-    # SAMRoute already loads these weights internally in __init__; the correct
-    # ckpt_path here must be a complete SAM-Road checkpoint (encoder + decoder).
-    # Auto-detect LoRA: if checkpoint has LoRA adapter weights (linear_a_q, linear_b_q, etc.)
-    # in image_encoder.blocks.*.attn.qkv, we must enable ENCODER_LORA for correct loading.
-    has_lora = any("attn.qkv.linear_a_q" in k or "attn.qkv.linear_a_v" in k for k in clean_sd)
-    if has_lora:
-        config.ENCODER_LORA = True
-        config.FREEZE_ENCODER = False
-        print(f"  LoRA detected in checkpoint → ENCODER_LORA=True")
-
-    has_decoder = any(k.startswith("map_decoder.") for k in clean_sd)
-    if not has_decoder:
-        raise ValueError(
-            f"\n\n  ✗ '{os.path.basename(ckpt_path)}' contains only SAM image-encoder "
-            f"weights (no map_decoder keys).\n"
-            f"  This file is the raw SAM pretrained encoder, NOT a complete SAM-Road "
-            f"checkpoint.\n"
-            f"  SAMRoute already loads it internally — you do NOT need to pass it as "
-            f"--ckpt.\n\n"
-            f"  Pass a SAM-Road finetuned checkpoint instead, e.g.:\n"
-            f"    --ckpt training_outputs/finetune_demo/checkpoints/"
-            f"best_pos8.0_dice0.5_thin4.0.ckpt\n"
-        )
-
-    # Auto-detect decoder variant BEFORE constructing the model
-    config.USE_SMOOTH_DECODER = _detect_smooth_decoder(clean_sd)
-    variant = "smooth (w/ anti-mosaic Conv2d)" if config.USE_SMOOTH_DECODER else "standard"
-    print(f"  Decoder variant detected: {variant}")
-
-    # Auto-detect patch size from pos_embed to avoid size-mismatch crashes when
-    # loading a checkpoint trained at a different resolution (e.g. 1024 vs 512).
-    detected_ps = _detect_patch_size(clean_sd)
-    if detected_ps is not None and detected_ps != config.PATCH_SIZE:
-        print(f"  Patch size auto-corrected: {config.PATCH_SIZE} → {detected_ps} "
-              f"(inferred from image_encoder.pos_embed)")
-        config.PATCH_SIZE = detected_ps
-
-    model = SAMRoute(config).to(device)
-    model.load_state_dict(clean_sd, strict=False)
-    print(f"✓ Loaded weights: {os.path.basename(ckpt_path)}")
-    model.eval()
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Image loading utilities
+# Image loading
 # ---------------------------------------------------------------------------
 
 def load_tif(tif_path: str) -> np.ndarray:
@@ -195,119 +81,7 @@ def load_tif(tif_path: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# A1 — Gaussian post-processing
-# ---------------------------------------------------------------------------
-
-def smooth_prob(road_prob: np.ndarray, sigma: float) -> np.ndarray:
-    """Apply optional Gaussian smoothing to the probability map.
-
-    sigma=0  → no-op (return original array).
-    sigma>0  → scipy Gaussian filter (preserves [0,1] range via clip).
-    """
-    if sigma <= 0.0:
-        return road_prob
-    from scipy.ndimage import gaussian_filter
-    return gaussian_filter(road_prob.astype(np.float32), sigma=sigma).clip(0.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# A2 — Sliding-window inference
-# ---------------------------------------------------------------------------
-
-def sliding_window_inference(
-    img_array: np.ndarray,
-    model: "SAMRoute",
-    device,
-    patch_size: int = 512,
-    stride: int = 256,
-    smooth_sigma: float = 0.0,
-    verbose: bool = True,
-) -> np.ndarray:
-    """Run inference over the full image using a sliding window.
-
-    Overlapping patch predictions are blended with a 2-D Hanning (cosine)
-    weight window, which tapers smoothly to zero at the edges.  This
-    eliminates visible seams at patch boundaries.
-
-    Args:
-        img_array   : uint8 RGB [H, W, 3]
-        model       : loaded SAMRoute in eval mode
-        device      : torch device
-        patch_size  : window side length (must match training patch size)
-        stride      : step between windows (stride < patch_size → overlap)
-        smooth_sigma: per-patch Gaussian smoothing applied before accumulation
-        verbose     : print progress
-
-    Returns:
-        full-image probability map [H, W] float32 in [0, 1]
-    """
-    H, W = img_array.shape[:2]
-
-    # 2-D Hanning window as blend weight (tapers smoothly toward edges).
-    # np.hanning() returns exactly 0 at both endpoints, so image border pixels
-    # that are only covered by one patch would get weight_sum==0 and stay 0
-    # (black border / missed roads).  Clamp endpoints to a small epsilon so
-    # every pixel receives a nonzero weight regardless of its position.
-    win1d = np.hanning(patch_size).astype(np.float32)
-    win1d = np.maximum(win1d, 1e-3)          # prevent zero-weight at endpoints
-    win2d = np.outer(win1d, win1d)
-
-    prob_sum   = np.zeros((H, W), dtype=np.float32)
-    weight_sum = np.zeros((H, W), dtype=np.float32)
-
-    # Build grid of top-left corners, ensuring the last column/row always
-    # falls inside the image (pad with edge values if necessary).
-    ys = list(range(0, max(1, H - patch_size + 1), stride))
-    xs = list(range(0, max(1, W - patch_size + 1), stride))
-    # Make sure the bottom / right edge is always covered
-    if ys[-1] + patch_size < H:
-        ys.append(H - patch_size)
-    if xs[-1] + patch_size < W:
-        xs.append(W - patch_size)
-
-    total = len(ys) * len(xs)
-    done  = 0
-
-    for y0 in ys:
-        for x0 in xs:
-            y1 = min(y0 + patch_size, H)
-            x1 = min(x0 + patch_size, W)
-            patch = img_array[y0:y1, x0:x1]
-
-            # Zero-pad if the image boundary is smaller than patch_size
-            ph, pw = patch.shape[:2]
-            if ph < patch_size or pw < patch_size:
-                padded = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
-                padded[:ph, :pw] = patch
-                patch = padded
-
-            rgb_t = torch.tensor(patch, dtype=torch.float32).unsqueeze(0).to(device)
-            with torch.no_grad():
-                _, ms = model._predict_mask_logits_scores(rgb_t)
-            prob = ms[0, :, :, 1].cpu().numpy()  # [patch_size, patch_size]
-
-            prob = smooth_prob(prob, smooth_sigma)
-
-            # Accumulate into the full-image arrays (trim back to actual size)
-            prob_sum[y0:y0 + ph, x0:x0 + pw]   += prob[:ph, :pw] * win2d[:ph, :pw]
-            weight_sum[y0:y0 + ph, x0:x0 + pw] += win2d[:ph, :pw]
-
-            done += 1
-            if verbose and (done % 10 == 0 or done == total):
-                print(f"  sliding window: {done}/{total} patches", end="\r")
-
-    if verbose:
-        print()
-
-    valid  = weight_sum > 0
-    result = np.zeros((H, W), dtype=np.float32)
-    result[valid] = prob_sum[valid] / weight_sum[valid]
-    return result
-
-
-
-# ---------------------------------------------------------------------------
-# NEW — interactive point picking + route visualisation (Eikonal shortest path)
+# Point utilities
 # ---------------------------------------------------------------------------
 
 def _parse_yx(s: str) -> tuple[int, int]:
@@ -336,7 +110,6 @@ def _pick_two_points(
     plt.close(fig)
     if len(pts) != 2:
         raise RuntimeError("Point picking cancelled or insufficient points. Need exactly 2 clicks.")
-    # ginput returns (x, y) in image coordinates.
     src = (int(round(pts[0][1])), int(round(pts[0][0])))
     tgt = (int(round(pts[1][1])), int(round(pts[1][0])))
     H, W = img.shape[:2]
@@ -369,6 +142,10 @@ def _snap_to_road(
     return (y0 + int(wy), x0 + int(wx))
 
 
+# ---------------------------------------------------------------------------
+# Path tracing (gradient descent on distance field T)
+# ---------------------------------------------------------------------------
+
 def _trace_path_descend_T(
     T: np.ndarray,
     src_yx: tuple[int, int],
@@ -377,10 +154,7 @@ def _trace_path_descend_T(
     connectivity8: bool = True,
     max_steps: "int | None" = None,
 ) -> np.ndarray:
-    """Backtrack a shortest path by descending the Eikonal distance field T.
-
-    Note: This is a discrete approximation of gradient-descent on T.
-    """
+    """Backtrack a shortest path by descending the Eikonal distance field T."""
     H, W = T.shape
     sy, sx = src_yx
     ty, tx = tgt_yx
@@ -400,8 +174,7 @@ def _trace_path_descend_T(
         if (y == sy) and (x == sx):
             break
         cur = float(T[y, x])
-        best = None  # (val, ny, nx)
-        # Prefer strictly decreasing steps; fall back to smallest neighbour if stuck.
+        best = None
         for dy, dx in nbrs:
             ny, nx = y + dy, x + dx
             if ny < 0 or ny >= H or nx < 0 or nx >= W:
@@ -427,142 +200,65 @@ def _trace_path_descend_T(
     return np.asarray(path, dtype=np.int32)
 
 
-def _roi_extract_square(
-    prob_map: np.ndarray,
-    src_yx: tuple[int, int],
-    tgt_yx: tuple[int, int],
-    *,
-    margin: int = 64,
-    min_size: int = 64,
-) -> tuple[np.ndarray, tuple[int, int], tuple[int, int], tuple[int, int]]:
-    """Extract a square ROI patch around src large enough to cover tgt (with padding)."""
-    H, W = prob_map.shape[:2]
-    sy, sx = src_yx
-    ty, tx = tgt_yx
-    span = int(max(abs(ty - sy), abs(tx - sx)))
-    half = span + int(margin)
-    P = max(2 * half + 1, int(min_size))
+# ---------------------------------------------------------------------------
+# Multigrid Eikonal solver (aligned with eval_ranking_accuracy.py)
+# ---------------------------------------------------------------------------
 
-    y0 = sy - half; x0 = sx - half
-    y1 = y0 + P;    x1 = x0 + P
+def _solve_all_sources_once(
+    model, cost_f, cost_c, all_src_yx, cfg,
+    ds, mg_f, mg_itc, mg_itf, device,
+    iter_floor_c: float = 1.5,
+    iter_floor_f: float = 0.8,
+):
+    """Solve Eikonal for ALL source points in a single batched call.
 
-    yy0 = max(y0, 0); xx0 = max(x0, 0)
-    yy1 = min(y1, H); xx1 = min(x1, W)
+    Returns the full fine-resolution distance map for each source.
 
-    patch = prob_map[yy0:yy1, xx0:xx1]
-    pad_t = yy0 - y0
-    pad_l = xx0 - x0
-    pad_b = y1 - yy1
-    pad_r = x1 - xx1
-    if pad_t or pad_l or pad_b or pad_r:
-        patch = np.pad(
-            patch, ((pad_t, pad_b), (pad_l, pad_r)),
-            mode="constant", constant_values=0.0
-        )
+    Args:
+        all_src_yx: [B, 2] pixel coords (each row a DIFFERENT source)
+        iter_floor_c: coarse iteration floor = max(Hc,Wc) * this
+        iter_floor_f: fine iteration floor = max(Hf,Wf) * this
+    Returns:
+        T_fine: [B, Hf, Wf] distance map per source
+    """
+    B = all_src_yx.shape[0]
+    Hf, Wf = cost_f.shape[-2], cost_f.shape[-1]
+    Hc, Wc = cost_c.shape[-2], cost_c.shape[-1]
+    large_val = float(cfg.large_val)
+    ds_coarse = ds * mg_f
+    ckpt_chunk = int(getattr(model, "route_ckpt_chunk", 10))
+    gate_alpha = float(getattr(model, "route_gate_alpha", 1.0))
 
-    src_rel = (int(np.clip(sy - y0, 0, P - 1)), int(np.clip(sx - x0, 0, P - 1)))
-    tgt_rel = (int(np.clip(ty - y0, 0, P - 1)), int(np.clip(tx - x0, 0, P - 1)))
-    return patch.astype(np.float32), (y0, x0), src_rel, tgt_rel
+    cost_c_b = cost_c.expand(B, -1, -1)
+    src_cc = (all_src_yx.long() // ds_coarse).clamp(min=0)
+    src_cc[:, 0] = src_cc[:, 0].clamp(0, Hc - 1)
+    src_cc[:, 1] = src_cc[:, 1].clamp(0, Wc - 1)
+    src_mask_c = _make_src_mask(B, Hc, Wc, src_cc, device)
 
+    actual_iters_c = int(max(mg_itc, int(max(Hc, Wc) * iter_floor_c)))
+    cfg_c = dc_replace(cfg, h=float(ds_coarse), n_iters=actual_iters_c, monotone=True)
+    T_c = _eikonal_soft_sweeping_diff(
+        cost_c_b, src_mask_c, cfg_c,
+        checkpoint_chunk=ckpt_chunk, gate_alpha=gate_alpha,
+    ).detach()
 
-def _compute_route_roi(
-    prob_map: np.ndarray,
-    model: "SAMRoute",
-    device,
-    *,
-    src_yx: tuple[int, int],
-    tgt_yx: tuple[int, int],
-    margin: int,
-    downsample: int,
-    n_iters: int,
-    snap_radius: int = 0,
-    snap_th: float = 0.5,
-    max_path_steps: "int | None" = None,
-) -> dict:
-    """Compute ROI Eikonal field + path on a probability map (prob_map in [0,1])."""
-    from dataclasses import replace
-    from eikonal import eikonal_soft_sweeping
+    T_init = F.interpolate(
+        T_c.unsqueeze(1), size=(Hf, Wf), mode="bilinear", align_corners=False,
+    ).squeeze(1).clamp_min(0.0).clamp_max(large_val)
+    src_fc = (all_src_yx.long() // ds).clamp(min=0)
+    src_fc[:, 0] = src_fc[:, 0].clamp(0, Hf - 1)
+    src_fc[:, 1] = src_fc[:, 1].clamp(0, Wf - 1)
+    src_mask_f = _make_src_mask(B, Hf, Wf, src_fc, device)
+    T_init = torch.where(src_mask_f, torch.zeros_like(T_init), T_init)
 
-    src0 = _snap_to_road(prob_map, src_yx, radius=snap_radius, th=snap_th)
-    tgt0 = _snap_to_road(prob_map, tgt_yx, radius=snap_radius, th=snap_th)
-
-    patch, (y0, x0), src_rel, tgt_rel = _roi_extract_square(
-        prob_map, src0, tgt0, margin=margin, min_size=64
+    cost_f_b = cost_f.expand(B, -1, -1)
+    actual_iters_f = int(max(mg_itf, int(max(Hf, Wf) * iter_floor_f)))
+    cfg_f = dc_replace(cfg, h=float(ds), n_iters=actual_iters_f, monotone=False)
+    T_fine = _eikonal_soft_sweeping_diff_init(
+        cost_f_b, src_mask_f, cfg_f, T_init,
+        checkpoint_chunk=ckpt_chunk, gate_alpha=gate_alpha,
     )
-
-    ds = max(1, int(downsample))
-
-    with torch.no_grad():
-        patch_t = torch.from_numpy(patch).to(device=device, dtype=torch.float32)
-
-        if ds > 1:
-            P = int(patch_t.shape[0])
-            P_pad = int(np.ceil(P / ds) * ds)
-            if P_pad > P:
-                patch_t = F.pad(patch_t, (0, P_pad - P, 0, P_pad - P), value=0.0)
-
-            patch_c = F.max_pool2d(
-                patch_t.unsqueeze(0).unsqueeze(0), kernel_size=ds, stride=ds
-            ).squeeze(0).squeeze(0)  # [P_c, P_c]
-
-            cost = model._road_prob_to_cost(patch_c.unsqueeze(0)).squeeze(0).to(dtype=torch.float32)
-            P_c = int(cost.shape[0])
-
-            src_c = (min(src_rel[0] // ds, P_c - 1), min(src_rel[1] // ds, P_c - 1))
-            tgt_c = (min(tgt_rel[0] // ds, P_c - 1), min(tgt_rel[1] // ds, P_c - 1))
-
-            src_mask = torch.zeros((1, P_c, P_c), dtype=torch.bool, device=device)
-            src_mask[0, src_c[0], src_c[1]] = True
-
-            # Inference: hard_eval is more faithful than STE.
-            cfg = replace(model.route_eik_cfg, n_iters=int(n_iters), h=float(ds), mode="hard_eval")
-            T = eikonal_soft_sweeping(cost.unsqueeze(0), src_mask, cfg)  # [1, P_c, P_c]
-            T_np = T[0].detach().cpu().numpy()
-
-            dist = float(T[0, tgt_c[0], tgt_c[1]].item())
-            path_c = _trace_path_descend_T(T_np, src_c, tgt_c, max_steps=max_path_steps)
-
-            path_full = np.zeros_like(path_c)
-            path_full[:, 0] = (path_c[:, 0] * ds + y0).clip(0, prob_map.shape[0] - 1)
-            path_full[:, 1] = (path_c[:, 1] * ds + x0).clip(0, prob_map.shape[1] - 1)
-
-            return {
-                "src_yx": src0, "tgt_yx": tgt0,
-                "dist": dist,
-                "T_roi": T_np,
-                "path_yx": path_full.astype(np.int32),
-                "roi_origin_yx": (y0, x0),
-                "ds": ds,
-                "roi_size": int(T_np.shape[0]),
-            }
-
-        # ds == 1
-        cost = model._road_prob_to_cost(patch_t.unsqueeze(0)).squeeze(0).to(dtype=torch.float32)
-        P = int(cost.shape[0])
-
-        src_mask = torch.zeros((1, P, P), dtype=torch.bool, device=device)
-        src_mask[0, src_rel[0], src_rel[1]] = True
-
-        cfg = replace(model.route_eik_cfg, n_iters=int(n_iters), h=1.0, mode="hard_eval")
-        T = eikonal_soft_sweeping(cost.unsqueeze(0), src_mask, cfg)  # [1, P, P]
-        T_np = T[0].detach().cpu().numpy()
-
-        dist = float(T[0, tgt_rel[0], tgt_rel[1]].item())
-        path_p = _trace_path_descend_T(T_np, src_rel, tgt_rel, max_steps=max_path_steps)
-
-        path_full = np.zeros_like(path_p)
-        path_full[:, 0] = (path_p[:, 0] + y0).clip(0, prob_map.shape[0] - 1)
-        path_full[:, 1] = (path_p[:, 1] + x0).clip(0, prob_map.shape[1] - 1)
-
-        return {
-            "src_yx": src0, "tgt_yx": tgt0,
-            "dist": dist,
-            "T_roi": T_np,
-            "path_yx": path_full.astype(np.int32),
-            "roi_origin_yx": (y0, x0),
-            "ds": 1,
-            "roi_size": int(T_np.shape[0]),
-        }
+    return T_fine
 
 
 # ---------------------------------------------------------------------------
@@ -573,55 +269,106 @@ def run_inference_on_tif(
     tif_path,
     ckpt_path=None,
     save_path=None,
-    encoder_lora=False,
-    lora_rank=4,
-    mode="center",
+    mode="sliding",
     stride=256,
     smooth_sigma=0.0,
-    # NEW: routing / path visualisation
-    route=False,
+    route=True,
     pick_points=False,
     src=None,
     tgt=None,
-    roi_margin=None,
-    eik_downsample=None,
-    eik_iters=None,
     snap_radius=25,
     snap_th=0.5,
     max_path_steps=None,
+    # --- eval-aligned parameters ---
+    tsp_load_ckpt="",
+    cost_net=False,
+    cost_net_ch=16,
+    downsample=16,
+    eik_iters=40,
+    gate_override=1.0,
+    alpha_override=50,
+    gamma_override=2.0,
+    iter_floor_c=1.2,
+    iter_floor_f=0.65,
+    gt_mask="",
+    npz_case=None,
+    p_count=20,
 ):
-    ckpt_path = ckpt_path or _SAMROAD_CKPT_DEFAULT
+    ckpt_path = ckpt_path or _CKPT_DEFAULT
     save_path = save_path or "tif_inference_route_result.png"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    config = InferenceConfig()
-    if encoder_lora:
-        config.ENCODER_LORA = True
-        config.LORA_RANK = lora_rank
-        config.FREEZE_ENCODER = False
-        print(f"LoRA inference mode: rank={lora_rank}")
+    # --- load model (aligned with eval_ranking_accuracy.py) ---
+    sd = _load_lightning_ckpt(ckpt_path)
+    cfg = GradcheckConfig()
+    has_lora = any("attn.qkv.linear_a_q" in k or "attn.qkv.linear_a_v" in k for k in sd)
+    if has_lora:
+        cfg.ENCODER_LORA = True
+        cfg.FREEZE_ENCODER = False
+        print(f"  LoRA detected in checkpoint -> ENCODER_LORA=True")
+    cfg.USE_SMOOTH_DECODER = _detect_smooth_decoder(sd)
+    ps = _detect_patch_size(sd)
+    if ps is not None:
+        cfg.PATCH_SIZE = ps
+    cfg.ROUTE_EIK_ITERS = eik_iters
+    cfg.ROUTE_EIK_DOWNSAMPLE = downsample
+    if cost_net:
+        cfg.ROUTE_COST_NET = True
+        cfg.ROUTE_COST_NET_CH = cost_net_ch
 
-    # 1. Load model (auto-detects decoder variant from checkpoint)
-    model = load_model(ckpt_path, config, device)
+    model = SAMRoute(cfg).to(device)
+    model.load_state_dict(sd, strict=False)
+    for p_param in model.image_encoder.parameters():
+        p_param.requires_grad_(False)
 
-    # 2. Load image
+    if tsp_load_ckpt and os.path.isfile(tsp_load_ckpt):
+        rckpt = torch.load(tsp_load_ckpt, map_location=device, weights_only=False)
+        with torch.no_grad():
+            if "cost_log_alpha" in rckpt:
+                model.cost_log_alpha.copy_(rckpt["cost_log_alpha"].to(device))
+            if "cost_log_gamma" in rckpt:
+                model.cost_log_gamma.copy_(rckpt["cost_log_gamma"].to(device))
+            if "eik_gate_logit" in rckpt:
+                model.eik_gate_logit.copy_(rckpt["eik_gate_logit"].to(device))
+        if "cost_net_state_dict" in rckpt and getattr(model, "cost_net", None) is not None:
+            model.cost_net.load_state_dict(rckpt["cost_net_state_dict"])
+        print(f"[loaded] routing ckpt: {tsp_load_ckpt}")
+
+    with torch.no_grad():
+        if gate_override >= 0:
+            logit = 10.0 if gate_override >= 0.9999 else math.log(
+                gate_override / max(1.0 - gate_override, 1e-9))
+            model.eik_gate_logit.fill_(logit)
+            print(f"[override] gate={gate_override:.4f} (logit={logit:.2f})")
+        if alpha_override > 0:
+            model.cost_log_alpha.fill_(math.log(alpha_override))
+            print(f"[override] alpha={alpha_override:.1f}")
+        if gamma_override > 0:
+            model.cost_log_gamma.fill_(math.log(gamma_override))
+            print(f"[override] gamma={gamma_override:.2f}")
+
+    model.eval()
+    model.route_gate_alpha = 0.8
+
+    # --- load image ---
     print(f"Reading image: {tif_path}")
-    img_array = load_tif(tif_path)
+    img_array = _load_rgb_from_tif(tif_path)
     h, w = img_array.shape[:2]
-    ps = config.PATCH_SIZE
+    print(f"[tif] {tif_path}  shape={h}x{w}")
 
     # ------------------------------------------------------------------
-    # Mode: center  — single 512×512 centre crop + Eikonal field
+    # Mode: center  — single 512x512 centre crop + Eikonal field
     # ------------------------------------------------------------------
     if mode == "center":
-        start_y = max(0, (h - ps) // 2)
-        start_x = max(0, (w - ps) // 2)
-        img_crop = img_array[start_y:start_y + ps, start_x:start_x + ps]
+        ps_val = cfg.PATCH_SIZE
+        start_y = max(0, (h - ps_val) // 2)
+        start_x = max(0, (w - ps_val) // 2)
+        img_crop = img_array[start_y:start_y + ps_val, start_x:start_x + ps_val]
 
-        if img_crop.shape[0] < ps or img_crop.shape[1] < ps:
-            pad = np.zeros((ps, ps, 3), dtype=np.uint8)
+        if img_crop.shape[0] < ps_val or img_crop.shape[1] < ps_val:
+            pad = np.zeros((ps_val, ps_val, 3), dtype=np.uint8)
             pad[:img_crop.shape[0], :img_crop.shape[1]] = img_crop
             img_crop = pad
 
@@ -630,25 +377,20 @@ def run_inference_on_tif(
         print("Generating probability mask (center crop)...")
         with torch.no_grad():
             _, mask_scores = model._predict_mask_logits_scores(rgb_tensor)
-            road_prob_tensor = mask_scores[..., 1]          # [1, H, W]
-            road_prob_raw    = road_prob_tensor[0].cpu().numpy()
+            road_prob_tensor = mask_scores[..., 1]
+            road_prob_raw = road_prob_tensor[0].cpu().numpy()
 
-        # A1: optional Gaussian post-processing
         road_prob = smooth_prob(road_prob_raw, smooth_sigma)
-        if smooth_sigma > 0:
-            print(f"  Applied Gaussian smoothing: sigma={smooth_sigma}")
 
-        # NEW: choose src / tgt (crop coordinates)
         if src is not None and tgt is not None:
             src_yx0 = _parse_yx(src) if isinstance(src, str) else tuple(src)
             tgt_yx0 = _parse_yx(tgt) if isinstance(tgt, str) else tuple(tgt)
         elif pick_points:
             src_yx0, tgt_yx0 = _pick_two_points(
                 img_crop, road_prob,
-                title="CENTER mode — click START then END (coordinates are within this 512×512 crop)"
+                title="CENTER mode -- click START then END (coordinates within 512x512 crop)"
             )
         else:
-            # fallback: pick two points from predicted road pixels
             y_coords, x_coords = np.where(road_prob > 0.5)
             if len(y_coords) > 10:
                 quarter = len(y_coords) // 4
@@ -658,7 +400,6 @@ def run_inference_on_tif(
                 src_yx0 = (64, 64)
                 tgt_yx0 = (448, 448)
 
-        # NEW: optional snapping to nearest road-like pixel (helps with imprecise clicks)
         src_yx0 = _snap_to_road(road_prob, src_yx0, radius=int(snap_radius), th=float(snap_th))
         tgt_yx0 = _snap_to_road(road_prob, tgt_yx0, radius=int(snap_radius), th=float(snap_th))
 
@@ -668,35 +409,32 @@ def run_inference_on_tif(
 
         print("Running Eikonal solver...")
         with torch.no_grad():
-            from dataclasses import replace
             from eikonal import make_source_mask, eikonal_soft_sweeping
 
             B, H_f, W_f = road_prob_tensor.shape
             cost = model._road_prob_to_cost(road_prob_tensor).to(dtype=torch.float32)
             src_mask = make_source_mask(H_f, W_f, src_yx.view(B, 1, 2))
 
-            iters = int(eik_iters) if eik_iters is not None else int(model.route_eik_cfg.n_iters)
-            cfg = replace(model.route_eik_cfg, n_iters=iters, h=1.0, mode="hard_eval")
+            iters_val = int(eik_iters) if eik_iters is not None else int(model.route_eik_cfg.n_iters)
+            eik_cfg = dc_replace(model.route_eik_cfg, n_iters=iters_val, h=1.0, mode="hard_eval")
 
-            T = eikonal_soft_sweeping(cost, src_mask, cfg)  # [B, H, W]
+            T = eikonal_soft_sweeping(cost, src_mask, eik_cfg)
             yy = tgt_yx[:, 0].clamp(0, H_f - 1)
             xx = tgt_yx[:, 1].clamp(0, W_f - 1)
             dist = T[torch.arange(B, device=device), yy, xx]
             dist_field = T[0].detach().cpu().numpy()
 
-        # NEW: backtrack a discrete path by descending T (for visualisation)
         path_yx = None
         if route:
             path_yx = _trace_path_descend_T(
                 dist_field, src_yx0, tgt_yx0, max_steps=max_path_steps
             )
 
-        # --- Visualisation (3-panel) ---
         print("Generating figure...")
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
         axes[0].imshow(img_crop)
-        axes[0].set_title("Cropped Satellite Image (Original Res)")
+        axes[0].set_title("Cropped Satellite Image")
         axes[0].plot(src_yx[0, 1].cpu(), src_yx[0, 0].cpu(), "g*", markersize=15, label="Start")
         axes[0].plot(tgt_yx[0, 1].cpu(), tgt_yx[0, 0].cpu(), "r*", markersize=15, label="End")
         if path_yx is not None:
@@ -704,12 +442,11 @@ def run_inference_on_tif(
         axes[0].legend()
         axes[0].axis("off")
 
-        sigma_str = f" (σ={smooth_sigma})" if smooth_sigma > 0 else ""
+        sigma_str = f" (sigma={smooth_sigma})" if smooth_sigma > 0 else ""
         im1 = axes[1].imshow(road_prob, cmap="magma", vmin=0, vmax=1)
         axes[1].set_title(f"Predicted Probability Mask{sigma_str}")
         if path_yx is not None:
             axes[1].plot(path_yx[:, 1], path_yx[:, 0], "-", linewidth=2.0)
-
         fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
         axes[1].axis("off")
 
@@ -721,30 +458,63 @@ def run_inference_on_tif(
         axes[2].axis("off")
 
     # ------------------------------------------------------------------
-    # Mode: sliding — full-image sliding window
+    # Mode: sliding — full-image sliding window + multigrid Eikonal
     # ------------------------------------------------------------------
     elif mode == "sliding":
-        print(f"Running sliding-window inference (stride={stride}, sigma={smooth_sigma})...")
-        road_prob = sliding_window_inference(
-            img_array, model, device,
-            patch_size=ps,
-            stride=stride,
-            smooth_sigma=smooth_sigma,
-            verbose=True,
-        )
+        # --- road_prob from GT mask, cache, or model inference ---
+        if gt_mask and os.path.isfile(gt_mask):
+            _gt_img = np.array(Image.open(gt_mask))
+            if _gt_img.ndim == 3:
+                _gt_img = _gt_img[:, :, 0]
+            road_prob_np = (_gt_img > 0).astype(np.float32)
+            if road_prob_np.shape != (h, w):
+                road_prob_np = np.array(
+                    Image.fromarray(road_prob_np).resize((w, h), Image.BILINEAR)
+                )
+            print(f"[GT mask] {gt_mask}  road_ratio={road_prob_np.mean():.4f}")
+        else:
+            cache = os.path.join("/tmp/vis_inference", "road_prob.npy")
+            if os.path.isfile(cache):
+                road_prob_np = np.load(cache).astype(np.float32)
+                print(f"[cache] loaded: {cache}")
+            else:
+                print(f"Running sliding-window inference (stride={stride}, sigma={smooth_sigma})...")
+                road_prob_np = sliding_window_inference(
+                    img_array, model, device,
+                    patch_size=int(cfg.PATCH_SIZE),
+                    stride=stride,
+                    smooth_sigma=smooth_sigma,
+                    verbose=True,
+                )
+                os.makedirs(os.path.dirname(cache), exist_ok=True)
+                np.save(cache, road_prob_np)
+                print(f"[cache] saved: {cache}")
 
-        # NEW: optional route planning (pick 2 points → Eikonal T → backtrack path)
+        road_prob = road_prob_np
+
         if route:
-            if src is not None and tgt is not None:
+            # --- determine src / tgt ---
+            if npz_case is not None:
+                tif_name = os.path.basename(tif_path)
+                location_key = tif_name.replace("crop_", "").replace("_z16.tif", "").replace(".tif", "")
+                npz_name = f"distance_dataset_all_{location_key}_p{p_count}.npz"
+                npz_path = os.path.join(os.path.dirname(tif_path), npz_name)
+                coords, udist, H_npz, W_npz = _load_npz_nodes(npz_path)
+                ci = int(npz_case) if npz_case < coords.shape[0] else 0
+                xy_norm = coords[ci]
+                yx = _normxy_to_yx(xy_norm, h, w)
+                src_yx0 = (int(yx[0, 0]), int(yx[0, 1]))
+                tgt_yx0 = (int(yx[1, 0]), int(yx[1, 1]))
+                print(f"[npz] case={ci}  nodes={yx.shape[0]}  src={src_yx0}  tgt={tgt_yx0}")
+            elif src is not None and tgt is not None:
                 src_yx0 = _parse_yx(src) if isinstance(src, str) else tuple(src)
                 tgt_yx0 = _parse_yx(tgt) if isinstance(tgt, str) else tuple(tgt)
             elif pick_points:
                 src_yx0, tgt_yx0 = _pick_two_points(
                     img_array, road_prob,
-                    title="SLIDING mode — click START then END (full-image coordinates)"
+                    title="SLIDING mode -- click START then END (full-image coordinates)"
                 )
             else:
-                # fallback: pick two points from predicted road pixels
                 y_coords, x_coords = np.where(road_prob > 0.5)
                 if len(y_coords) > 10:
                     quarter = len(y_coords) // 4
@@ -754,58 +524,96 @@ def run_inference_on_tif(
                     src_yx0 = (h // 4, w // 4)
                     tgt_yx0 = (3 * h // 4, 3 * w // 4)
 
-            margin = int(roi_margin) if roi_margin is not None else int(getattr(model, "route_roi_margin", 64))
-            ds = int(eik_downsample) if eik_downsample is not None else int(getattr(model, "route_eik_downsample", 4))
-            iters = int(eik_iters) if eik_iters is not None else int(getattr(model.route_eik_cfg, "n_iters", 200))
+            src_yx0 = _snap_to_road(road_prob, src_yx0, radius=int(snap_radius), th=float(snap_th))
+            tgt_yx0 = _snap_to_road(road_prob, tgt_yx0, radius=int(snap_radius), th=float(snap_th))
+            print(f"  src={src_yx0}  tgt={tgt_yx0}")
 
-            route_out = _compute_route_roi(
-                road_prob, model, device,
-                src_yx=src_yx0, tgt_yx=tgt_yx0,
-                margin=margin,
-                downsample=ds,
-                n_iters=iters,
-                snap_radius=int(snap_radius),
-                snap_th=float(snap_th),
-                max_path_steps=max_path_steps,
+            # --- multigrid Eikonal solve (aligned with eval) ---
+            ds = downsample
+            mg_f = 4
+            eps = 1e-6
+            road_prob_t = torch.from_numpy(road_prob).to(device, torch.float32).unsqueeze(0)
+            road_prob_t = road_prob_t.clamp(eps, 1.0 - eps)
+
+            with torch.no_grad():
+                prob_f, _, _ = _maxpool_prob(road_prob_t, ds)
+                cost_f = model._road_prob_to_cost(prob_f).to(torch.float32)
+                prob_c, _, _ = _maxpool_prob(road_prob_t, ds * mg_f)
+                cost_c = model._road_prob_to_cost(prob_c).to(torch.float32)
+
+            mg_itc = max(20, int(eik_iters * 0.25))
+            mg_itf = max(20, int(eik_iters * 0.80))
+
+            all_src_yx = torch.tensor([[src_yx0[0], src_yx0[1]]], dtype=torch.long, device=device)
+
+            print("Running multigrid Eikonal solver...")
+            with torch.no_grad():
+                T_maps = _solve_all_sources_once(
+                    model, cost_f, cost_c, all_src_yx,
+                    model.route_eik_cfg, ds, mg_f, mg_itc, mg_itf, device,
+                    iter_floor_c=iter_floor_c,
+                    iter_floor_f=iter_floor_f,
+                )
+
+            T_fine = T_maps[0].detach().cpu().numpy()
+            Hf, Wf = T_fine.shape
+
+            # query distance at target
+            tgt_fc_y = min(tgt_yx0[0] // ds, Hf - 1)
+            tgt_fc_x = min(tgt_yx0[1] // ds, Wf - 1)
+            dist_val = float(T_fine[tgt_fc_y, tgt_fc_x])
+
+            # also compute Euclidean for _mix_eikonal_euclid
+            euc_dist = math.sqrt((tgt_yx0[0] - src_yx0[0]) ** 2 + (tgt_yx0[1] - src_yx0[1]) ** 2)
+            gate_logit = model.eik_gate_logit
+            T_eik_t = torch.tensor([dist_val], device=device, dtype=torch.float32)
+            d_euc_t = torch.tensor([euc_dist], device=device, dtype=torch.float32)
+            mixed_dist = _mix_eikonal_euclid(
+                T_eik_t.unsqueeze(0), d_euc_t.unsqueeze(0), gate_logit,
+            ).squeeze(0).detach().cpu().item()
+
+            print(f"Route distance: Eikonal={dist_val:.2f}  Euclidean={euc_dist:.2f}  "
+                  f"Mixed={mixed_dist:.2f}  (ds={ds}, grid={Hf}x{Wf})")
+
+            # --- trace path on fine-scale grid, map to original resolution ---
+            src_grid = (min(src_yx0[0] // ds, Hf - 1), min(src_yx0[1] // ds, Wf - 1))
+            tgt_grid = (tgt_fc_y, tgt_fc_x)
+            path_grid = _trace_path_descend_T(
+                T_fine, src_grid, tgt_grid, max_steps=max_path_steps,
             )
-            dist = route_out["dist"]
-            path_yx = route_out["path_yx"]
-            src_use = route_out["src_yx"]
-            tgt_use = route_out["tgt_yx"]
-            T_roi = route_out["T_roi"]
+            path_yx = np.zeros_like(path_grid)
+            path_yx[:, 0] = np.clip(path_grid[:, 0] * ds, 0, h - 1)
+            path_yx[:, 1] = np.clip(path_grid[:, 1] * ds, 0, w - 1)
 
-            print(f"Route distance (T at target): {dist:.2f}  (ds={route_out['ds']}, ROI={route_out['roi_size']}x{route_out['roi_size']})")
-
+            # --- visualisation (3-panel) ---
             print("Generating figure...")
             fig, axes = plt.subplots(1, 3, figsize=(22, 8))
 
-            # Panel 1: satellite + route
             axes[0].imshow(img_array)
-            axes[0].plot(src_use[1], src_use[0], "g*", markersize=14, label="Start")
-            axes[0].plot(tgt_use[1], tgt_use[0], "r*", markersize=14, label="End")
+            axes[0].plot(src_yx0[1], src_yx0[0], "g*", markersize=14, label="Start")
+            axes[0].plot(tgt_yx0[1], tgt_yx0[0], "r*", markersize=14, label="End")
             axes[0].plot(path_yx[:, 1], path_yx[:, 0], "-", linewidth=2.0, label="Route")
             axes[0].set_title("Full Satellite + Planned Route")
             axes[0].legend()
             axes[0].axis("off")
 
-            # Panel 2: probability + route
-            sigma_str = f" (σ={smooth_sigma})" if smooth_sigma > 0 else ""
+            sigma_str = f" (sigma={smooth_sigma})" if smooth_sigma > 0 else ""
             im1 = axes[1].imshow(road_prob, cmap="magma", vmin=0, vmax=1)
             axes[1].plot(path_yx[:, 1], path_yx[:, 0], "-", linewidth=2.0)
             axes[1].set_title(f"Road Probability + Route{sigma_str}")
             fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
             axes[1].axis("off")
 
-            # Panel 3: ROI T field (coarse)
-            valid = T_roi[T_roi < 1e8]
+            valid = T_fine[T_fine < 1e8]
             vmax = np.percentile(valid, 95) if valid.size > 0 else 1000
-            im2 = axes[2].imshow(T_roi, cmap="viridis", vmax=vmax)
-            axes[2].set_title(f"ROI Eikonal Field (coarse)\nTarget Cost: {dist:.2f}")
+            im2 = axes[2].imshow(T_fine, cmap="viridis", vmax=vmax)
+            axes[2].set_title(f"Multigrid Eikonal (fine, ds={ds})\n"
+                              f"Eik={dist_val:.1f}  Mixed={mixed_dist:.1f}")
             fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
             axes[2].axis("off")
 
         else:
-            # --- Visualisation (2-panel) ---
+            # --- no route: 2-panel visualisation ---
             print("Generating figure...")
             fig, axes = plt.subplots(1, 2, figsize=(20, 10))
 
@@ -813,19 +621,18 @@ def run_inference_on_tif(
             axes[0].set_title("Full Satellite Image")
             axes[0].axis("off")
 
-            sigma_str = f" (σ={smooth_sigma})" if smooth_sigma > 0 else ""
+            sigma_str = f" (sigma={smooth_sigma})" if smooth_sigma > 0 else ""
             im1 = axes[1].imshow(road_prob, cmap="magma", vmin=0, vmax=1)
             axes[1].set_title(f"Predicted Road Probability (Sliding Window){sigma_str}")
             fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
             axes[1].axis("off")
-
 
     else:
         raise ValueError(f"Unknown mode '{mode}'. Choose 'center' or 'sliding'.")
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
-    print(f"Saved → {os.path.abspath(save_path)}")
+    print(f"Saved -> {os.path.abspath(save_path)}")
     plt.show()
 
 
@@ -834,67 +641,78 @@ def run_inference_on_tif(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="SAM-Road inference on TIF image")
+    p = argparse.ArgumentParser(
+        description="SAM-Road inference + multigrid Eikonal route visualisation (aligned with eval)")
+
+    # --- model / checkpoint ---
     p.add_argument(
-        "--ckpt", type=str, default=_SAMROAD_CKPT_DEFAULT,
-        help="SAM-Road checkpoint path (encoder + decoder). "
-             "Default: best_lora_pos8.0_dice0.5_thin4.0.ckpt (finetune_demo). "
-             "Do NOT pass sam_vit_b_01ec64.pth here — that is the raw SAM encoder "
-             "and is loaded internally by SAMRoute automatically.",
+        "--ckpt", type=str, default=_CKPT_DEFAULT,
+        help="SAM-Road checkpoint path (encoder + decoder).",
     )
-    p.add_argument(
-        "--output", type=str, default="tif_inference_route_result.png",
-        help="Output figure path (default distinct from test_inference.py)",
-    )
+    p.add_argument("--tsp_load_ckpt", type=str, default="",
+                   help="Routing checkpoint (.pt) with alpha/gamma/gate/cost_net weights.")
+    p.add_argument("--cost_net", action="store_true",
+                   help="Enable neural residual cost net.")
+    p.add_argument("--cost_net_ch", type=int, default=16)
+
+    # --- image / data ---
     p.add_argument(
         "--tif", type=str,
-        default="Gen_dataset_V2/Gen_dataset/19.940688_110.276704/00_20.021516_110.190699_3000.0/crop_20.021516_110.190699_3000.0_z16.tif",
+        default="Gen_dataset_V2/Gen_dataset/19.940688_110.276704/"
+                "00_20.021516_110.190699_3000.0/crop_20.021516_110.190699_3000.0_z16.tif",
         help="Target TIF path",
     )
-    p.add_argument(
-        "--mode", type=str, default="sliding", choices=["center", "sliding"],
-        help="'center': single 512x512 crop + Eikonal. 'sliding': full-image sliding window.",
-    )
-    p.add_argument(
-        "--stride", type=int, default=256,
-        help="Sliding-window stride in pixels (default 256 = 50%% overlap)",
-    )
-    p.add_argument(
-        "--smooth_sigma", type=float, default=0.0,
-        help="Gaussian post-processing sigma (0 = off). Reduces 16-px ViT token grid.",
-    )
+    p.add_argument("--gt_mask", type=str, default="",
+                   help="Path to GT road mask image. If given, use as road_prob instead of model.")
 
-    # NEW: route planning / distance query
-    p.add_argument("--route", action="store_true", default=True,
-                   help="Compute road-aware distance T between two points and visualise the route.")
+    # --- mode / inference ---
+    p.add_argument("--output", type=str, default="tif_inference_route_result.png")
+    p.add_argument("--mode", type=str, default="sliding", choices=["center", "sliding"])
+    p.add_argument("--stride", type=int, default=256,
+                   help="Sliding-window stride in pixels (default 256 = 50%% overlap)")
+    p.add_argument("--smooth_sigma", type=float, default=0.0,
+                   help="Gaussian post-processing sigma (0 = off).")
+
+    # --- route planning ---
+    p.add_argument("--route", action="store_true", default=True)
+    p.add_argument("--no-route", dest="route", action="store_false")
     p.add_argument("--pick_points", action="store_true",
-                   help="Interactively click two points on the image (after inference).")
-    p.add_argument("--src", type=str, default=None,
-                   help="Start point in 'y,x' (pixels). If set, disables interactive picking.")
-    p.add_argument("--tgt", type=str, default=None,
-                   help="End point in 'y,x' (pixels). If set, disables interactive picking.")
-    p.add_argument("--roi_margin", type=int, default=None,
-                   help="ROI margin (px) around the src-tgt span for Eikonal solve (default: model ROUTE_ROI_MARGIN).")
-    p.add_argument("--eik_downsample", type=int, default=None,
-                   help="Downsample factor for route Eikonal solve (default: model ROUTE_EIK_DOWNSAMPLE).")
-    p.add_argument("--eik_iters", type=int, default=None,
-                   help="Number of Eikonal iterations (default: model ROUTE_EIK_ITERS).")
-    p.add_argument("--snap_radius", type=int, default=25,
-                   help="Snap clicked points to nearest road-like pixel within this radius (0 disables).")
-    p.add_argument("--snap_th", type=float, default=0.5,
-                   help="Road probability threshold for snapping.")
-    p.add_argument("--max_path_steps", type=int, default=None,
-                   help="Max backtracking steps when extracting the path (default: H*W).")
-    p.add_argument("--encoder_lora", action="store_true", help="Enable LoRA encoder weights")
-    p.add_argument("--lora_rank", type=int, default=4, help="LoRA rank (must match training)")
+                   help="Interactively click two points on the image.")
+    p.add_argument("--src", type=str, default=None, help="Start point 'y,x' (pixels).")
+    p.add_argument("--tgt", type=str, default=None, help="End point 'y,x' (pixels).")
+    p.add_argument("--snap_radius", type=int, default=25)
+    p.add_argument("--snap_th", type=float, default=0.5)
+    p.add_argument("--max_path_steps", type=int, default=None)
+
+    # --- Eikonal parameters (aligned with eval defaults) ---
+    p.add_argument("--downsample", type=int, default=16,
+                   help="Eikonal grid downsample factor. 16 is optimal (SWEEP 3).")
+    p.add_argument("--eik_iters", type=int, default=40,
+                   help="Eikonal iteration hint (actual count controlled by iter_floor).")
+    p.add_argument("--gate_override", type=float, default=1.0,
+                   help="Eikonal/Euclidean gate (0-1). 1.0=pure Eikonal. -1=checkpoint value.")
+    p.add_argument("--alpha_override", type=float, default=50,
+                   help="Cost alpha. 50 is optimal. -1=checkpoint value.")
+    p.add_argument("--gamma_override", type=float, default=2.0,
+                   help="Cost gamma. 2.0 is optimal. -1=checkpoint value.")
+    p.add_argument("--iter_floor_c", type=float, default=1.2,
+                   help="Coarse iteration floor multiplier.")
+    p.add_argument("--iter_floor_f", type=float, default=0.65,
+                   help="Fine iteration floor multiplier.")
+
+    # --- NPZ case selection (optional) ---
+    p.add_argument("--npz_case", type=int, default=None,
+                   help="Case index from NPZ to select src/tgt nodes.")
+    p.add_argument("--p_count", type=int, default=20,
+                   help="Node count variant for NPZ filename (20/50/100).")
+
+    p.add_argument("--device", type=str, default="cuda")
     args = p.parse_args()
 
     run_inference_on_tif(
         args.tif,
         ckpt_path=args.ckpt,
         save_path=args.output,
-        encoder_lora=args.encoder_lora,
-        lora_rank=args.lora_rank,
         mode=args.mode,
         stride=args.stride,
         smooth_sigma=args.smooth_sigma,
@@ -902,10 +720,20 @@ if __name__ == "__main__":
         pick_points=args.pick_points,
         src=args.src,
         tgt=args.tgt,
-        roi_margin=args.roi_margin,
-        eik_downsample=args.eik_downsample,
-        eik_iters=args.eik_iters,
         snap_radius=args.snap_radius,
         snap_th=args.snap_th,
         max_path_steps=args.max_path_steps,
+        tsp_load_ckpt=args.tsp_load_ckpt,
+        cost_net=args.cost_net,
+        cost_net_ch=args.cost_net_ch,
+        downsample=args.downsample,
+        eik_iters=args.eik_iters,
+        gate_override=args.gate_override,
+        alpha_override=args.alpha_override,
+        gamma_override=args.gamma_override,
+        iter_floor_c=args.iter_floor_c,
+        iter_floor_f=args.iter_floor_f,
+        gt_mask=args.gt_mask,
+        npz_case=args.npz_case,
+        p_count=args.p_count,
     )

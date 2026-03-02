@@ -96,6 +96,12 @@ class GradcheckConfig:
         self.ROUTE_BLOCK_TH = 0.0
         self.ROUTE_ROI_MARGIN = 64
 
+        # --- neural residual cost net ---
+        self.ROUTE_COST_NET = False
+        self.ROUTE_COST_NET_CH = 8
+        self.ROUTE_COST_NET_USE_COORD = False
+        self.ROUTE_COST_NET_DELTA_SCALE = 0.75
+
         # Eikonal params (CLI override)
         self.ROUTE_EIK_ITERS = 200
         self.ROUTE_EIK_DOWNSAMPLE = 4
@@ -236,6 +242,97 @@ def sliding_window_inference(
     m = weight_sum > 0
     out[m] = prob_sum[m] / weight_sum[m]
     return out
+
+
+def _cache_encoder_features(
+    img_array: np.ndarray,
+    model: "SAMRoute",
+    device: torch.device,
+    patch_size: int = 512,
+    stride: int = 256,
+) -> Tuple[List[Tuple[int, int, int, int]], List[torch.Tensor], np.ndarray]:
+    """Pre-compute and cache encoder features for all sliding-window patches.
+
+    Returns:
+        patches_info: list of (y0, x0, ph, pw) for each patch
+        features: list of encoder feature tensors [1, C, Hf, Wf] (on CPU)
+        win2d: Hanning window [patch_size, patch_size]
+    """
+    H, W = img_array.shape[:2]
+    win1d = np.hanning(patch_size).astype(np.float32)
+    win1d = np.maximum(win1d, 1e-3)
+    win2d = np.outer(win1d, win1d)
+
+    ys = list(range(0, max(1, H - patch_size + 1), stride))
+    xs = list(range(0, max(1, W - patch_size + 1), stride))
+    if ys[-1] + patch_size < H:
+        ys.append(H - patch_size)
+    if xs[-1] + patch_size < W:
+        xs.append(W - patch_size)
+
+    patches_info = []
+    features = []
+    total = len(ys) * len(xs)
+    done = 0
+
+    with torch.no_grad():
+        for y0 in ys:
+            for x0 in xs:
+                y1 = min(y0 + patch_size, H)
+                x1 = min(x0 + patch_size, W)
+                patch = img_array[y0:y1, x0:x1]
+                ph, pw = patch.shape[:2]
+                if ph < patch_size or pw < patch_size:
+                    padded = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
+                    padded[:ph, :pw] = patch
+                    patch = padded
+
+                rgb_t = torch.tensor(patch, dtype=torch.float32).unsqueeze(0).to(device)
+                x_enc = rgb_t.permute(0, 3, 1, 2)
+                x_enc = (x_enc - model.pixel_mean) / model.pixel_std
+                feat = model.image_encoder(x_enc).cpu()
+
+                patches_info.append((y0, x0, ph, pw))
+                features.append(feat)
+
+                done += 1
+                if done % 10 == 0 or done == total:
+                    print(f"  caching encoder features: {done}/{total}", end="\r")
+    print()
+    return patches_info, features, win2d
+
+
+def _road_prob_from_cached_features(
+    model: "SAMRoute",
+    patches_info: List[Tuple[int, int, int, int]],
+    features: List[torch.Tensor],
+    win2d: np.ndarray,
+    H: int, W: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Recompute road_prob from cached encoder features WITH decoder gradients.
+
+    Returns:
+        road_prob: [1, H, W] tensor with gradient through decoder.
+    """
+    patch_size = win2d.shape[0]
+    win_t = torch.from_numpy(win2d).to(device)
+    prob_sum = torch.zeros(H, W, device=device)
+    weight_sum = torch.zeros(H, W, device=device)
+
+    for (y0, x0, ph, pw), feat in zip(patches_info, features):
+        feat_gpu = feat.to(device)
+        _, ms = model._predict_mask_logits_scores(None, encoder_feat=feat_gpu)
+        prob = ms[0, :, :, 1]  # [patch_size, patch_size]
+
+        prob_sum[y0:y0 + ph, x0:x0 + pw] = prob_sum[y0:y0 + ph, x0:x0 + pw] + \
+            prob[:ph, :pw] * win_t[:ph, :pw]
+        weight_sum[y0:y0 + ph, x0:x0 + pw] = weight_sum[y0:y0 + ph, x0:x0 + pw] + \
+            win_t[:ph, :pw]
+
+    safe_weight = weight_sum.clamp(min=1e-6)
+    road_prob = prob_sum / safe_weight
+    return road_prob.unsqueeze(0)  # [1, H, W]
 
 
 # -----------------------------------------------------------------------------
@@ -385,6 +482,22 @@ def _make_src_mask(B: int, Hc: int, Wc: int, src_yx_c: torch.Tensor, device) -> 
         x = max(0, min(x, Wc - 1))
         m[b, y, x] = True
     return m
+
+
+def _residual_reg(delta_log: torch.Tensor) -> torch.Tensor:
+    """L2 + zero-mean constraint: prevents global cost scaling cheats."""
+    if delta_log.numel() == 0:
+        return delta_log.sum() * 0.0
+    return (delta_log ** 2).mean() + (delta_log.mean() ** 2)
+
+
+def _tv_l1(x: torch.Tensor) -> torch.Tensor:
+    """Total variation (L1) on a [B,H,W] or [H,W] tensor."""
+    if x.numel() == 0:
+        return x.sum() * 0.0
+    dx = (x[..., 1:] - x[..., :-1]).abs().mean()
+    dy = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
+    return dx + dy
 
 
 def _backtrack_path_on_grid(
@@ -1221,6 +1334,40 @@ def _run_tsp_train(
     if args.freeze_encoder:
         for p in model.image_encoder.parameters():
             p.requires_grad = False
+    # --- load routing checkpoint if provided ---
+    if getattr(args, "tsp_load_ckpt", "") and os.path.isfile(args.tsp_load_ckpt):
+        rckpt = torch.load(args.tsp_load_ckpt, map_location=device, weights_only=False)
+        with torch.no_grad():
+            if "cost_log_alpha" in rckpt:
+                model.cost_log_alpha.copy_(rckpt["cost_log_alpha"].to(device))
+            if "cost_log_gamma" in rckpt:
+                model.cost_log_gamma.copy_(rckpt["cost_log_gamma"].to(device))
+            if "eik_gate_logit" in rckpt:
+                model.eik_gate_logit.copy_(rckpt["eik_gate_logit"].to(device))
+        if "cost_net_state_dict" in rckpt and getattr(model, "cost_net", None) is not None:
+            model.cost_net.load_state_dict(rckpt["cost_net_state_dict"])
+        if "decoder_state_dict" in rckpt and hasattr(model, "map_decoder"):
+            model.map_decoder.load_state_dict(rckpt["decoder_state_dict"])
+        print(f"[resumed] routing params from {args.tsp_load_ckpt}")
+
+    # --- online decoder: cache encoder features ---
+    online_decoder = getattr(args, "online_decoder", False)
+    enc_patches_info = None
+    enc_features = None
+    enc_win2d = None
+    if online_decoder:
+        print("[online_decoder] Caching encoder features for all patches ...")
+        enc_patches_info, enc_features, enc_win2d = _cache_encoder_features(
+            rgb, model, device,
+            patch_size=int(cfg.PATCH_SIZE),
+            stride=int(args.stride),
+        )
+        print(f"  Cached {len(enc_features)} patches of encoder features")
+        if hasattr(model, "map_decoder"):
+            for p in model.map_decoder.parameters():
+                p.requires_grad = True
+            print(f"  Decoder unfrozen for distance-driven fine-tuning")
+
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=float(args.lr))
     print(f"Trainable params: {sum(p.numel() for p in params)}")
@@ -1251,6 +1398,9 @@ def _run_tsp_train(
 
     # --- training loop ---
     print(f"\n===== TSP Training: {len(train_cases)} cases x {args.tsp_epochs} epochs =====")
+    if online_decoder:
+        print(f"  [online_decoder] recompute road_prob every {args.decoder_grad_every} cases")
+
     rp_in = road_prob_t.clamp(eps, 1.0 - eps)
 
     ds = int(args.downsample)
@@ -1270,8 +1420,24 @@ def _run_tsp_train(
         case_order = train_cases.copy()
         rng.shuffle(case_order)
 
+        _need_rp_refresh = True  # force first recompute at epoch start
+
         for ci_pos, ci in enumerate(case_order):
             opt.zero_grad(set_to_none=True)
+
+            # online_decoder: periodically recompute road_prob through decoder
+            if online_decoder and _need_rp_refresh:
+                rp_online = _road_prob_from_cached_features(
+                    model, enc_patches_info, enc_features, enc_win2d,
+                    H, W, device,
+                )
+                rp_online = rp_online.clamp(eps, 1.0 - eps)
+                prob_f_cached, _, _ = _maxpool_prob(rp_online, ds)
+                Hf_cached, Wf_cached = prob_f_cached.shape[-2], prob_f_cached.shape[-1]
+                if args.multigrid:
+                    prob_c_cached, _, _ = _maxpool_prob(rp_online, ds_coarse_t)
+                _need_rp_refresh = False
+
             pairs = _prepare_all_node_pairs(coords, udist, H, W, ci, K)
             if not pairs:
                 continue
@@ -1326,12 +1492,33 @@ def _run_tsp_train(
             if valid.any():
                 pred_in, gt_in, _sat = _apply_cap(pred, gt_t, norm, args.cap_mult, args.cap_mode)
                 loss_case = model.dist_criterion(pred_in[valid], gt_in[valid])
+
+                # cost_net regularization
+                if getattr(model, "cost_net", None) is not None:
+                    delta_f = model._cost_net_delta_log(prob_f_cached)
+                    if delta_f is not None:
+                        loss_case = loss_case + float(args.lambda_cost_reg) * _residual_reg(delta_f)
+                        if float(args.lambda_cost_tv) > 0:
+                            loss_case = loss_case + float(args.lambda_cost_tv) * _tv_l1(delta_f)
+                    if bool(args.reg_on_coarse) and args.multigrid:
+                        delta_c = model._cost_net_delta_log(prob_c_cached)
+                        if delta_c is not None:
+                            loss_case = loss_case + float(args.lambda_cost_reg) * _residual_reg(delta_c)
+
                 loss_case.backward()
                 with torch.no_grad():
                     case_mae = float((pred[valid] - gt_t[valid]).abs().mean().item())
                 epoch_losses.append(float(loss_case.item()))
                 epoch_maes.append(case_mae)
                 n_valid_nodes = 1
+
+            # after backward, detach cached probs (graph is freed)
+            if online_decoder:
+                prob_f_cached = prob_f_cached.detach()
+                if args.multigrid:
+                    prob_c_cached = prob_c_cached.detach()
+                if (ci_pos + 1) % max(1, int(args.decoder_grad_every)) == 0:
+                    _need_rp_refresh = True
 
             # gradient guard
             has_bad = False
@@ -1364,9 +1551,17 @@ def _run_tsp_train(
 
     # --- final evaluation ---
     print(f"\n===== Final Evaluation ({len(eval_cases)} cases) =====")
+    eval_rp = road_prob_t
+    if online_decoder:
+        print("  [online_decoder] Recomputing road_prob through updated decoder for final eval...")
+        with torch.no_grad():
+            eval_rp = _road_prob_from_cached_features(
+                model, enc_patches_info, enc_features, enc_win2d,
+                H, W, device,
+            )
     with torch.no_grad():
         final_metrics = _tsp_evaluate(
-            model, road_prob_t, coords, udist, H, W,
+            model, eval_rp, coords, udist, H, W,
             eval_cases, args, cfg, device, tag="final",
         )
 
@@ -1382,6 +1577,14 @@ def _run_tsp_train(
             "args": vars(args),
             "final_metrics": final_metrics,
         }
+        if getattr(model, "cost_net", None) is not None:
+            save_dict["cost_net_state_dict"] = {
+                k: v.detach().cpu() for k, v in model.cost_net.state_dict().items()
+            }
+        if getattr(args, "online_decoder", False) and hasattr(model, "map_decoder"):
+            save_dict["decoder_state_dict"] = {
+                k: v.detach().cpu() for k, v in model.map_decoder.state_dict().items()
+            }
         torch.save(save_dict, args.tsp_save_ckpt)
         print(f"[saved] routing checkpoint: {args.tsp_save_ckpt}")
 
@@ -1426,6 +1629,22 @@ def main():
     ap.add_argument("--profile_time", action="store_true")
     ap.add_argument("--gate_alpha", type=float, default=0.8,
                     help="GPPN residual gate alpha (0.8 recommended for multigrid)")
+
+    # cost net
+    ap.add_argument("--cost_net", action=argparse.BooleanOptionalAction, default=False,
+                    help="Enable ResidualCostNet in prob->cost mapping")
+    ap.add_argument("--cost_net_ch", type=int, default=8,
+                    help="ResidualCostNet hidden channels")
+    ap.add_argument("--cost_net_use_coord", action="store_true",
+                    help="Append (y,x) coord channels to cost net input")
+    ap.add_argument("--cost_net_delta_scale", type=float, default=0.75,
+                    help="Scale of bounded log-residual (tanh * scale)")
+    ap.add_argument("--lambda_cost_reg", type=float, default=1e-3,
+                    help="L2/mean regularization on cost residual (prevents global cheating)")
+    ap.add_argument("--lambda_cost_tv", type=float, default=0.0,
+                    help="TV regularization on cost residual (optional smoothing)")
+    ap.add_argument("--reg_on_coarse", action="store_true",
+                    help="Also regularize coarse-grid cost residual")
 
     # multigrid / tube
     ap.add_argument("--multigrid", action=argparse.BooleanOptionalAction, default=True)
@@ -1500,6 +1719,12 @@ def main():
                     help="Print training progress every N cases")
     ap.add_argument("--tsp_save_ckpt", type=str, default="",
                     help="Path to save routing-branch checkpoint after TSP training")
+    ap.add_argument("--tsp_load_ckpt", type=str, default="",
+                    help="Path to load routing-branch checkpoint (resumes cost params + CostNet)")
+    ap.add_argument("--online_decoder", action="store_true",
+                    help="Recompute road_prob through decoder each step (enables decoder gradient)")
+    ap.add_argument("--decoder_grad_every", type=int, default=5,
+                    help="Recompute road_prob through decoder every N cases (amortizes cost)")
 
     # --- performance ---
     ap.add_argument("--compile_eikonal", action="store_true",
@@ -1538,10 +1763,20 @@ def main():
     cfg.ROUTE_LAMBDA_SEG = float(args.lambda_seg)
     cfg.ROUTE_LAMBDA_DIST = float(args.lambda_dist)
 
+    # cost net config
+    cfg.ROUTE_COST_NET = bool(args.cost_net)
+    cfg.ROUTE_COST_NET_CH = int(args.cost_net_ch)
+    cfg.ROUTE_COST_NET_USE_COORD = bool(args.cost_net_use_coord)
+    cfg.ROUTE_COST_NET_DELTA_SCALE = float(args.cost_net_delta_scale)
+
     print(f"Model patch_size={cfg.PATCH_SIZE}, smooth_decoder={cfg.USE_SMOOTH_DECODER}")
     print(f"Eikonal iters(train)={cfg.ROUTE_EIK_ITERS}, downsample(train)={cfg.ROUTE_EIK_DOWNSAMPLE}")
     print(f"Loss weights: lambda_seg={cfg.ROUTE_LAMBDA_SEG}, lambda_dist={cfg.ROUTE_LAMBDA_DIST}")
     print(f"cap_mode={args.cap_mode}, cap_mult={args.cap_mult}")
+    if cfg.ROUTE_COST_NET:
+        print(f"[cost_net] enabled: ch={cfg.ROUTE_COST_NET_CH}, "
+              f"coord={cfg.ROUTE_COST_NET_USE_COORD}, "
+              f"delta_scale={cfg.ROUTE_COST_NET_DELTA_SCALE}")
     if args.multigrid:
         print(f"[multigrid] enabled: mg_factor={args.mg_factor}")
 

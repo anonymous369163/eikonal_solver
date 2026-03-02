@@ -198,6 +198,31 @@ class _LoRA_qkv(nn.Module):
 
 
 
+class ResidualCostNet(torch.nn.Module):
+    """Lightweight CNN that predicts a bounded log-cost residual from a prob map.
+
+    Predicts delta_log_cost (bounded by tanh), applied as:
+        cost = base_cost * exp(delta_log_cost)
+
+    Guarantees strictly-positive cost. Last layer is zero-initialized so the
+    network starts as identity (delta=0 => exp(0)=1 => no change).
+    """
+
+    def __init__(self, in_ch: int = 1, mid_ch: int = 8):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(mid_ch, 1, kernel_size=1, bias=False),
+        )
+        torch.nn.init.zeros_(self.net[-1].weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class SAMRoad(pl.LightningModule):
     """This is the RelationFormer module that performs object detection"""
 
@@ -1216,6 +1241,18 @@ class SAMRoute(SAMRoad):
         self.route_tube_max_area_ratio = float(_cfg(config, "ROUTE_TUBE_MAX_AREA_RATIO", 0.90))
         self.route_tube_min_side       = int(_cfg(config,  "ROUTE_TUBE_MIN_SIDE",       16))
 
+        # --- Neural residual cost net (optional; adds spatial context to prob->cost) ---
+        self.route_cost_net             = bool(_cfg(config, "ROUTE_COST_NET", False))
+        self.route_cost_net_ch          = int(_cfg(config,  "ROUTE_COST_NET_CH", 8))
+        self.route_cost_net_use_coord   = bool(_cfg(config, "ROUTE_COST_NET_USE_COORD", False))
+        self.route_cost_net_delta_scale = float(_cfg(config, "ROUTE_COST_NET_DELTA_SCALE", 0.75))
+
+        if self.route_cost_net:
+            in_ch = 1 + (2 if self.route_cost_net_use_coord else 0)
+            self.cost_net = ResidualCostNet(in_ch=in_ch, mid_ch=self.route_cost_net_ch)
+        else:
+            self.cost_net = None
+
         # Learnable Eikonal-Euclidean blending gate (residual form)
         _gate_init = float(_cfg(config, "ROUTE_EIK_GATE_INIT", 0.80))
         _gate_init = max(0.01, min(0.99, _gate_init))
@@ -1290,6 +1327,31 @@ class SAMRoute(SAMRoad):
         mask_scores = torch.sigmoid(mask_logits)
         return mask_logits.permute(0, 2, 3, 1), mask_scores.permute(0, 2, 3, 1)
 
+    def _cost_net_delta_log(self, road_prob: torch.Tensor) -> "torch.Tensor | None":
+        """Compute tanh-bounded log-cost residual via ResidualCostNet.
+
+        Args:
+            road_prob: [B, H, W] probability map (already pooled to grid resolution).
+
+        Returns:
+            delta_log: [B, H, W] bounded in (-delta_scale, +delta_scale), or None
+                       if cost_net is disabled.
+        """
+        if self.cost_net is None:
+            return None
+        if road_prob.dim() == 2:
+            road_prob = road_prob.unsqueeze(0)
+        x = road_prob.unsqueeze(1)  # [B,1,H,W]
+        if self.route_cost_net_use_coord:
+            B, _, H, W = x.shape
+            yy = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype)
+            xx = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype)
+            yy = yy.view(1, 1, H, 1).expand(B, -1, -1, W)
+            xx = xx.view(1, 1, 1, W).expand(B, -1, H, -1)
+            x = torch.cat([x, yy, xx], dim=1)  # [B,3,H,W]
+        raw = self.cost_net(x)  # [B,1,H,W]
+        return (torch.tanh(raw) * self.route_cost_net_delta_scale).squeeze(1)  # [B,H,W]
+
     def _road_prob_to_cost(self, road_prob: torch.Tensor) -> torch.Tensor:
         """
         Differentiable prob → cost, dispatched by self.route_cost_mode.
@@ -1302,9 +1364,13 @@ class SAMRoute(SAMRoad):
         "exp" (original):
             cost = exp(log(offroad_penalty)*(1-p)^gamma) * sigmoid_amp
             → T is in cost units; steeper but harder to supervise with GT lengths.
+
+        Optional neural residual (if ROUTE_COST_NET=True):
+            delta_log = tanh(CNN(prob[, coords])) * delta_scale
+            cost = base_cost * exp(delta_log)
         """
         if self.route_cost_mode == "exp":
-            return _prob_to_cost_smooth(
+            base_cost = _prob_to_cost_smooth(
                 road_prob,
                 gamma           = self.route_gamma,
                 offroad_penalty = self.route_offroad_penalty,
@@ -1312,20 +1378,27 @@ class SAMRoute(SAMRoad):
                 block_smooth    = self.route_block_smooth,
                 eps             = self.route_eps,
             )
-        # default: "add" — alpha/gamma are learnable (log-space + clamp)
-        alpha = self.cost_log_alpha.clamp(
-            _math.log(5.0), _math.log(100.0)).exp()
-        gamma = self.cost_log_gamma.clamp(
-            _math.log(0.5), _math.log(4.0)).exp()
-        return _prob_to_cost_additive(
-            road_prob,
-            alpha        = alpha,
-            gamma        = gamma,
-            block_th     = self.route_block_th,
-            block_alpha  = self.route_add_block_alpha,
-            block_smooth = self.route_add_block_smooth,
-            eps          = self.route_eps,
-        )
+        else:
+            # default: "add" — alpha/gamma are learnable (log-space + clamp)
+            alpha = self.cost_log_alpha.clamp(
+                _math.log(5.0), _math.log(100.0)).exp()
+            gamma = self.cost_log_gamma.clamp(
+                _math.log(0.5), _math.log(4.0)).exp()
+            base_cost = _prob_to_cost_additive(
+                road_prob,
+                alpha        = alpha,
+                gamma        = gamma,
+                block_th     = self.route_block_th,
+                block_alpha  = self.route_add_block_alpha,
+                block_smooth = self.route_add_block_smooth,
+                eps          = self.route_eps,
+            )
+
+        delta_log = self._cost_net_delta_log(road_prob)
+        if delta_log is not None:
+            base_cost = base_cost * torch.exp(delta_log)
+
+        return base_cost
 
     def _apply_dist_cap(
         self,
