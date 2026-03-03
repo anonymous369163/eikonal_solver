@@ -259,6 +259,10 @@ def main():
     if has_lora:
         cfg.ENCODER_LORA = True
         cfg.FREEZE_ENCODER = False
+        for k, v in sd.items():
+            if "linear_a_q.weight" in k:
+                cfg.LORA_RANK = v.shape[0]
+                break
     cfg.USE_SMOOTH_DECODER = _detect_smooth_decoder(sd)
     ps = _detect_patch_size(sd)
     if ps is not None:
