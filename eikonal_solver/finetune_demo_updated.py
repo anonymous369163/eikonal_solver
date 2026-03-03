@@ -801,7 +801,7 @@ def train(args):
         logger=tb_logger,
         callbacks=[checkpoint_callback, lr_monitor],
         log_every_n_steps=10 if args.single_region_dir else 50, # 单图模式打印勤一点
-        val_check_interval=1.0 if args.single_region_dir else 0.25, # 单图每epoch验证
+        val_check_interval=1.0, # 每epoch验证一次
         enable_progress_bar=True,
         enable_model_summary=False,
     )
