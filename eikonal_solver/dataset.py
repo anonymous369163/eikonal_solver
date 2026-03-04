@@ -701,16 +701,12 @@ class MMRouteDataset(Dataset):
             if len(tgt_list) >= K:
                 break
             d_norm = float(udist[case_idx, anchor_idx, ni])
-            if d_norm <= 0 or not np.isfinite(d_norm):
-                continue
-            gt_dist_px = d_norm * H_full
-            if gt_dist_px > gt_cap:
-                continue
             euclid_px = float(np.sqrt(
                 (px[anchor_idx, 0] - px[ni, 0]) ** 2
                 + (px[anchor_idx, 1] - px[ni, 1]) ** 2
             ))
-            if euclid_px > 1.0 and gt_dist_px / euclid_px > detour_cap:
+            valid, gt_dist_px = _is_valid_pair(d_norm, H_full, euclid_px, gt_cap, detour_cap)
+            if not valid:
                 continue
             tgt_y = max(0, min(ps - 1, int(round(px[ni, 1])) - y0))
             tgt_x = max(0, min(ps - 1, int(round(px[ni, 0])) - x0))
@@ -789,21 +785,12 @@ class MMRouteDataset(Dataset):
             for j in range(i + 1, len(inside_idx)):
                 ni, nj = inside_idx[i], inside_idx[j]
                 d_norm = float(udist[case_idx, ni, nj])
-                if d_norm <= 0 or not np.isfinite(d_norm):
-                    continue
-
-                # undirected_dist_norm = d_meters / meta_distance_ref_m (bbox_max)
-                # For square images: d_norm * H_full = d_meters * pixels_per_meter
-                gt_dist_px = d_norm * H_full
-
-                if gt_dist_px > gt_cap:
-                    continue
-
-                euclid_px = np.sqrt(
+                euclid_px = float(np.sqrt(
                     (px[ni, 0] - px[nj, 0]) ** 2
                     + (px[ni, 1] - px[nj, 1]) ** 2
-                )
-                if euclid_px > 1.0 and gt_dist_px / euclid_px > detour_cap:
+                ))
+                valid, gt_dist_px = _is_valid_pair(d_norm, H_full, euclid_px, gt_cap, detour_cap)
+                if not valid:
                     continue
 
                 src_yx_patch = [
@@ -824,6 +811,27 @@ class MMRouteDataset(Dataset):
                 ]
                 return src_yx_patch, tgt_yx_patch, gt_dist_px
         return None
+
+
+def _is_valid_pair(
+    d_norm: float,
+    H_full: int,
+    euclid_px: float,
+    gt_cap: float,
+    detour_cap: float,
+) -> "tuple[bool, float]":
+    """Check whether a (src, tgt) node pair passes distance-based filters.
+
+    Returns (is_valid, gt_dist_px).
+    """
+    if d_norm <= 0 or not np.isfinite(d_norm):
+        return False, 0.0
+    gt_dist_px = d_norm * H_full
+    if gt_dist_px > gt_cap:
+        return False, gt_dist_px
+    if euclid_px > 1.0 and gt_dist_px / euclid_px > detour_cap:
+        return False, gt_dist_px
+    return True, gt_dist_px
 
 
 # ---------------------------------------------------------------------------
@@ -915,11 +923,6 @@ class ThreadedLoader:
                         return
                     items = [self.dataset[i] for i in batch_idx]
                     collated = self._collate(items)
-                    if self.pin_memory:
-                        collated = {
-                            k: v.pin_memory() if torch.is_tensor(v) else v
-                            for k, v in collated.items()
-                        }
                     out_q.put(collated)
             except Exception as e:
                 out_q.put(e)
@@ -940,6 +943,11 @@ class ThreadedLoader:
                     raise RuntimeError(
                         f"ThreadedLoader worker crashed: {item}"
                     ) from item
+                if self.pin_memory:
+                    item = {
+                        k: v.pin_memory() if torch.is_tensor(v) else v
+                        for k, v in item.items()
+                    }
                 yield item
                 yielded += 1
             except queue.Empty:
@@ -1046,24 +1054,15 @@ def build_dataloaders(
         print(f"[build_dataloaders] Using ThreadedLoader (no IPC, {num_workers} workers). "
               f"train={len(train_loader)} batches, val={len(val_loader)} batches.")
     else:
-        def _collate(batch):
-            keys_all = {k for s in batch for k in s}
-            out = {}
-            for k in keys_all:
-                vals = [s[k] for s in batch if k in s]
-                if len(vals) == len(batch):
-                    out[k] = torch.stack(vals, dim=0)
-            return out
-
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
             num_workers=num_workers, pin_memory=True, drop_last=True,
-            collate_fn=_collate, persistent_workers=(num_workers > 0),
+            collate_fn=_default_collate, persistent_workers=(num_workers > 0),
         )
         val_loader = DataLoader(
             val_ds, batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=True, drop_last=False,
-            collate_fn=_collate, persistent_workers=(num_workers > 0),
+            collate_fn=_default_collate, persistent_workers=(num_workers > 0),
         )
     return train_loader, val_loader
 

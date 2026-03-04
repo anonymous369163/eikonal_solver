@@ -128,12 +128,13 @@ seg_lora)
 #    LR: cosine annealing with 3-epoch warmup, 2e-4 -> 1e-6
 # ------------------------------------------------------------------
 seg_dist_lora)
-    OUTPUT_DIR="training_outputs/fulldataset_seg_dist_lora"
-    RUN_NAME="${RUN_NAME:-seg_dist_lora_full}"
+    V2_CKPT="training_outputs/fulldataset_seg_dist_lora_v2/checkpoints/best_seg_dist_lora_v2.ckpt"
+    OUTPUT_DIR="training_outputs/fulldataset_seg_dist_lora_v3"
+    RUN_NAME="${RUN_NAME:-seg_dist_lora_v3}"
     python finetune_demo_updated.py \
         --data_root              "$DATA_ROOT" \
-        --pretrained_ckpt        "$PRETRAINED" \
-        --epochs                 "$EPOCHS" \
+        --pretrained_ckpt        "$V2_CKPT" \
+        --epochs                 20 \
         --batch_size             16 \
         --devices                "$NGPUS" \
         --workers                "$WORKERS" \
@@ -166,12 +167,65 @@ seg_dist_lora)
         --mg_factor              4 \
         --ckpt_chunk             20 \
         --grad_clip              1.0 \
-        --freeze_cost_params
+        --freeze_cost_params \
+        --road_pos_weight        15 \
+        --road_dice_weight       0.5
+    ;;
+
+# ------------------------------------------------------------------
+# 6) Focal Loss ablation — single-image quick test on GPU0
+#    Base: seg_dist_lora config, warm-start from v2 best checkpoint
+#    Usage: CUDA_VISIBLE_DEVICES=0 ./run_fulldataset_train.sh ablation_focal [run_name]
+# ------------------------------------------------------------------
+ablation_focal)
+    HAINAN_REGION="Gen_dataset_V2/Gen_dataset/19.940688_110.276704/00_20.021516_110.190699_3000.0"
+    V2_CKPT="training_outputs/fulldataset_seg_dist_lora_v2/checkpoints/best_seg_dist_lora_v2.ckpt"
+    OUTPUT_DIR="training_outputs/ablation_focal"
+    RUN_NAME="${RUN_NAME:-ablation_focal}"
+    python finetune_demo_updated.py \
+        --single_region_dir      "$HAINAN_REGION" \
+        --pretrained_ckpt        "$V2_CKPT" \
+        --epochs                 10 \
+        --batch_size             16 \
+        --devices                1 \
+        --workers                "$WORKERS" \
+        --val_fraction           "$VAL_FRAC" \
+        --road_dilation_radius   "$DILATION" \
+        --output_dir             "$OUTPUT_DIR" \
+        --run_name               "$RUN_NAME" \
+        --lr                     2e-4 \
+        --lr_scheduler           cosine \
+        --lr_warmup_epochs       1 \
+        --lr_min                 1e-6 \
+        --encoder_lora \
+        --lora_rank              4 \
+        --lambda_dist            0.05 \
+        --dist_supervision       gtmask_random \
+        --dist_k_targets         4 \
+        --dist_src_onroad_p      0.9 \
+        --dist_tgt_onroad_p      0.9 \
+        --dist_min_euclid_px     64 \
+        --dist_max_euclid_px     192 \
+        --dist_teacher_alpha     20.0 \
+        --dist_teacher_gamma     2.0 \
+        --dist_teacher_mask      thick \
+        --dist_gt_cap_factor     0.85 \
+        --dist_detour_cap        12.0 \
+        --multigrid \
+        --eik_iters              40 \
+        --eik_downsample         16 \
+        --mg_factor              4 \
+        --ckpt_chunk             20 \
+        --grad_clip              1.0 \
+        --freeze_cost_params \
+        --road_focal_loss \
+        --road_focal_alpha       0.75 \
+        --road_focal_gamma       2.0
     ;;
 
 *)
     echo "Unknown mode: $MODE"
-    echo "Usage: $0 {seg_only|seg_dist_npz|seg_dist_gtmask|seg_lora|seg_dist_lora} [run_name]"
+    echo "Usage: $0 {seg_only|seg_dist_npz|seg_dist_gtmask|seg_lora|seg_dist_lora|ablation_focal} [run_name]"
     exit 1
     ;;
 esac

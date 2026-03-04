@@ -214,6 +214,10 @@ def eikonal_soft_sweeping(
     T = torch.full((B, H, W), cfg.large_val, device=device, dtype=cost.dtype)
 
     if source_yx is not None:
+        assert B == 1, (
+            f"source_yx tuple only supports B=1, got B={B}. "
+            f"Use source_mask for batched input."
+        )
         sy, sx = int(source_yx[0]), int(source_yx[1])
         T[:, sy, sx] = 0.0
     else:

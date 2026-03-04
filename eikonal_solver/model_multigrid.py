@@ -47,7 +47,8 @@ class BilinearSampler(nn.Module):
         Args:
             feature_maps (Tensor): The input feature tensor of shape [B, D, H, W].
             sample_points (Tensor): The 2D sample points of shape [B, N_points, 2],
-                                    each point in the range [-1, 1], format (x, y).
+                                    in pixel coords [0, PATCH_SIZE], format (x, y).
+                                    Internally normalized to [-1, 1] for grid_sample.
         Returns:
             Tensor: Sampled feature vectors of shape [B, N_points, D].
         """
@@ -1265,7 +1266,8 @@ class SAMRoute(SAMRoad):
         self._lambda_dist_field      = float(_cfg(config, "LAMBDA_DIST_FIELD", 0.2))
         self._dense_field_min_pixels = int(_cfg(config, "DENSE_FIELD_MIN_PIXELS", 10))
         self._dense_field_cap_factor = float(_cfg(config, "DENSE_FIELD_CAP_FACTOR", 0.85))
-        self._last_field_meta        = None
+        self._field_meta_current_step = None
+        self._field_meta_step        = -1
 
         # --- Neural residual cost net (optional; adds spatial context to prob->cost) ---
         self.route_cost_net             = bool(_cfg(config, "ROUTE_COST_NET", False))
@@ -1298,6 +1300,9 @@ class SAMRoute(SAMRoad):
         self._road_dual_target  = bool(_cfg(config, "ROAD_DUAL_TARGET", False))
         # Extra BCE weight for thin-road pixels when dual_target. Higher = more emphasis on fine roads.
         self._road_thin_boost   = float(_cfg(config, "ROAD_THIN_BOOST", 5.0))
+        self._road_focal_loss   = bool(_cfg(config, "ROAD_FOCAL_LOSS", False))
+        self._road_focal_alpha  = float(_cfg(config, "ROAD_FOCAL_ALPHA", 0.75))
+        self._road_focal_gamma  = float(_cfg(config, "ROAD_FOCAL_GAMMA", 2.0))
         self.road_criterion = torch.nn.BCEWithLogitsLoss()  # pos_weight applied dynamically in _seg_forward
         self.dist_criterion = torch.nn.HuberLoss(delta=2.0)
 
@@ -1643,6 +1648,158 @@ class SAMRoute(SAMRoad):
         return dist
 
     # ------------------------------------------------------------------
+    # End-to-end differentiable N×N distance matrix
+    # ------------------------------------------------------------------
+
+    def forward_distance_matrix(
+        self,
+        nodes_yx: torch.Tensor,
+        *,
+        rgb: "torch.Tensor | None" = None,
+        road_prob: "torch.Tensor | None" = None,
+        ds: int = 16,
+        mg_factor: int = 4,
+        eik_iters: int = 40,
+        pool_mode: str = "max",
+        iter_floor_c: float = 1.2,
+        iter_floor_f: float = 0.65,
+    ) -> torch.Tensor:
+        """Differentiable N×N distance matrix from image or road probability.
+
+        Provide exactly one of ``rgb`` or ``road_prob``:
+          - ``rgb``       [1, H, W, 3] float 0-255  -- runs encoder+decoder (fully differentiable)
+          - ``road_prob`` [1, H, W]    float (0,1)   -- skips segmentation (differentiable from prob onward)
+
+        Pipeline (aligned with eval_ranking_accuracy._solve_all_sources_once):
+          road_prob -> pool(fine/coarse) -> _road_prob_to_cost
+          -> multigrid Eikonal (coarse solve -> upsample -> fine solve)
+          -> lookup at node positions -> _mix_eikonal_euclid -> D [N, N]
+
+        Args:
+            nodes_yx:    [N, 2] int64 tensor, pixel coords (y, x).
+            rgb:         [1, H, W, 3] float tensor, mutually exclusive with road_prob.
+            road_prob:   [1, H, W] float tensor in (0, 1), mutually exclusive with rgb.
+            ds:          fine-grid Eikonal downsample factor.
+            mg_factor:   multigrid coarse-to-fine ratio.
+            eik_iters:   Eikonal iteration hint.
+            pool_mode:   "max" or "avg" for road_prob downsampling.
+            iter_floor_c: coarse iteration floor = max(Hc,Wc) * this.
+            iter_floor_f: fine iteration floor = max(Hf,Wf) * this.
+
+        Returns:
+            D: [N, N] distance matrix (pixel-unit road distances).
+        """
+        from dataclasses import replace as _dc_replace
+
+        if rgb is not None and road_prob is None:
+            _, mask_scores = self._predict_mask_logits_scores(rgb)
+            road_prob = mask_scores[..., 1]  # [1, H, W]
+
+        if road_prob is None:
+            raise ValueError("Provide either rgb or road_prob")
+
+        road_prob = road_prob.clamp(1e-6, 1.0 - 1e-6)
+        device = road_prob.device
+        H, W = road_prob.shape[-2], road_prob.shape[-1]
+        N = nodes_yx.shape[0]
+
+        # -- helper: pool prob [1,H,W] -> [1,Hp,Wp] --
+        def _pool(prob: torch.Tensor, factor: int) -> torch.Tensor:
+            if factor <= 1:
+                return prob
+            x = prob.unsqueeze(1)  # [1,1,H,W]
+            ph = (factor - prob.shape[-2] % factor) % factor
+            pw = (factor - prob.shape[-1] % factor) % factor
+            if ph or pw:
+                x = F.pad(x, (0, pw, 0, ph), value=0.0)
+            if pool_mode == "avg":
+                return F.avg_pool2d(x, kernel_size=factor, stride=factor).squeeze(1)
+            return F.max_pool2d(x, kernel_size=factor, stride=factor).squeeze(1)
+
+        # -- dual-scale cost maps --
+        prob_f = _pool(road_prob, ds)
+        cost_f = self._road_prob_to_cost(prob_f).to(torch.float32)  # [1, Hf, Wf]
+
+        ds_coarse = ds * mg_factor
+        prob_c = _pool(road_prob, ds_coarse)
+        cost_c = self._road_prob_to_cost(prob_c).to(torch.float32)  # [1, Hc, Wc]
+
+        Hf, Wf = cost_f.shape[-2], cost_f.shape[-1]
+        Hc, Wc = cost_c.shape[-2], cost_c.shape[-1]
+
+        # -- clamp node coords --
+        src_yx = nodes_yx.to(device, torch.long)
+        src_yx[:, 0] = src_yx[:, 0].clamp(0, H - 1)
+        src_yx[:, 1] = src_yx[:, 1].clamp(0, W - 1)
+
+        # -- helper: create source mask [B, Hg, Wg] --
+        def _src_mask(B: int, Hg: int, Wg: int, yx_g: torch.Tensor) -> torch.Tensor:
+            m = torch.zeros((B, Hg, Wg), dtype=torch.bool, device=device)
+            for b in range(B):
+                y = int(yx_g[b, 0].item())
+                x = int(yx_g[b, 1].item())
+                m[b, max(0, min(y, Hg - 1)), max(0, min(x, Wg - 1))] = True
+            return m
+
+        # -- multigrid Eikonal solve (all N sources batched) --
+        cfg = self.route_eik_cfg
+        large_val = float(cfg.large_val)
+        ckpt_chunk = int(self.route_ckpt_chunk)
+        gate_alpha = float(self.route_gate_alpha)
+
+        # coarse solve
+        cost_c_b = cost_c.expand(N, -1, -1)
+        src_cc = (src_yx // ds_coarse).clamp(min=0)
+        src_cc[:, 0] = src_cc[:, 0].clamp(0, Hc - 1)
+        src_cc[:, 1] = src_cc[:, 1].clamp(0, Wc - 1)
+
+        mg_itc = max(20, int(eik_iters * 0.25))
+        mg_itf = max(20, int(eik_iters * 0.80))
+        actual_iters_c = int(max(mg_itc, int(max(Hc, Wc) * iter_floor_c)))
+        cfg_c = _dc_replace(cfg, h=float(ds_coarse), n_iters=actual_iters_c, monotone=True)
+
+        T_c = _eikonal_soft_sweeping_diff(
+            cost_c_b, _src_mask(N, Hc, Wc, src_cc), cfg_c,
+            checkpoint_chunk=ckpt_chunk, gate_alpha=gate_alpha,
+        ).detach()
+
+        # warm-start upsample
+        T_init = F.interpolate(
+            T_c.unsqueeze(1), size=(Hf, Wf), mode="bilinear", align_corners=False,
+        ).squeeze(1).clamp_min(0.0).clamp_max(large_val)
+
+        src_fc = (src_yx // ds).clamp(min=0)
+        src_fc[:, 0] = src_fc[:, 0].clamp(0, Hf - 1)
+        src_fc[:, 1] = src_fc[:, 1].clamp(0, Wf - 1)
+        src_mask_f = _src_mask(N, Hf, Wf, src_fc)
+        T_init = torch.where(src_mask_f, torch.zeros_like(T_init), T_init)
+
+        # fine solve
+        cost_f_b = cost_f.expand(N, -1, -1)
+        actual_iters_f = int(max(mg_itf, int(max(Hf, Wf) * iter_floor_f)))
+        cfg_f = _dc_replace(cfg, h=float(ds), n_iters=actual_iters_f, monotone=False)
+
+        T_maps = _eikonal_soft_sweeping_diff_init(
+            cost_f_b, src_mask_f, cfg_f, T_init,
+            checkpoint_chunk=ckpt_chunk, gate_alpha=gate_alpha,
+        )  # [N, Hf, Wf]
+
+        # -- lookup N×N distance matrix --
+        tgt_fc = (src_yx // ds).clamp(min=0)
+        tgt_fc[:, 0] = tgt_fc[:, 0].clamp(0, Hf - 1)
+        tgt_fc[:, 1] = tgt_fc[:, 1].clamp(0, Wf - 1)
+
+        D_eik = torch.stack([T_maps[i, tgt_fc[:, 0], tgt_fc[:, 1]] for i in range(N)])
+
+        # Euclidean (differentiable, pure tensor ops)
+        src_f = src_yx.float()
+        D_euc = ((src_f[:, None, :] - src_f[None, :, :]) ** 2).sum(-1).sqrt()
+
+        D = _mix_eikonal_euclid(D_eik, D_euc, self.eik_gate_logit)
+        D = D - D.diag().diag()
+        return D
+
+    # ------------------------------------------------------------------
     # training_step
     # ------------------------------------------------------------------
 
@@ -1671,27 +1828,32 @@ class SAMRoute(SAMRoad):
         road_logits = mask_logits[..., 1]   # [B, H, W]
         road_prob   = mask_scores[..., 1]   # [B, H, W]
 
-        # --- Robust normalized spatial weighted BCE loss ---
-        # 1. Per-pixel BCE (no reduction)
-        bce_raw = torch.nn.functional.binary_cross_entropy_with_logits(
-            road_logits, road_mask, reduction='none'
-        )
-
-        # 2. Base weight map (background = 1.0)
-        w = torch.ones_like(road_mask, dtype=road_logits.dtype)
-        pos_w = self._road_pos_weight
-
-        # 3. Thick road positives: weight = pos_w
-        w = w + (pos_w - 1.0) * (road_mask > 0.5).to(w.dtype)
-
-        # 4. If dual_target, extra boost for thin skeleton (thin_boost x thick weight)
-        if self._road_dual_target and "road_mask_thin" in batch:
-            thin = batch["road_mask_thin"].to(w.device)
-            thin_boost = self._road_thin_boost
-            w = w + (pos_w * thin_boost - 1.0) * (thin > 0.5).to(w.dtype)
-
-        # 5. Normalize by weight sum (stable loss scale across batches)
-        loss_bce = (bce_raw * w).sum() / (w.sum() + 1e-6)
+        # --- Per-pixel classification loss (BCE or Focal) ---
+        if self._road_focal_loss:
+            import torchvision.ops
+            loss_raw = torchvision.ops.sigmoid_focal_loss(
+                road_logits, road_mask,
+                alpha=self._road_focal_alpha,
+                gamma=self._road_focal_gamma,
+                reduction='none',
+            )
+            w = torch.ones_like(road_mask, dtype=road_logits.dtype)
+            if self._road_dual_target and "road_mask_thin" in batch:
+                thin = batch["road_mask_thin"].to(w.device)
+                w = w + (self._road_thin_boost - 1.0) * (thin > 0.5).to(w.dtype)
+            loss_bce = (loss_raw * w).sum() / (w.sum() + 1e-6)
+        else:
+            bce_raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                road_logits, road_mask, reduction='none'
+            )
+            w = torch.ones_like(road_mask, dtype=road_logits.dtype)
+            pos_w = self._road_pos_weight
+            w = w + (pos_w - 1.0) * (road_mask > 0.5).to(w.dtype)
+            if self._road_dual_target and "road_mask_thin" in batch:
+                thin = batch["road_mask_thin"].to(w.device)
+                thin_boost = self._road_thin_boost
+                w = w + (pos_w * thin_boost - 1.0) * (thin > 0.5).to(w.dtype)
+            loss_bce = (bce_raw * w).sum() / (w.sum() + 1e-6)
 
         # --- Dice loss ---
         # When dual_target is enabled, Dice is computed against the THIN
@@ -1787,7 +1949,8 @@ class SAMRoute(SAMRoad):
                         return_field=_want_field,
                     )
                     if _want_field:
-                        pred_dist_raw, self._last_field_meta = _solve_out
+                        pred_dist_raw, self._field_meta_current_step = _solve_out
+                        self._field_meta_step = self.global_step
                     else:
                         pred_dist_raw = _solve_out
                 else:
@@ -2030,6 +2193,160 @@ class SAMRoute(SAMRoad):
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     # ------------------------------------------------------------------
+    # Shared ROI helpers for batched Eikonal solve
+    # ------------------------------------------------------------------
+
+    def _compute_roi_geom(
+        self,
+        src_yx: torch.Tensor,       # [B, 2]
+        tgt_yx_k: torch.Tensor,     # [B, K, 2]
+        gt_dist_k: torch.Tensor,    # [B, K]
+        margin: int,
+        min_ds: int,
+    ):
+        """Compute per-element ROI geometry and common grid parameters.
+
+        Returns:
+            geom: list of (y0, x0, P, sr_y, sr_x, ds, valid_mask) per batch
+            ds_common: shared downsample factor (= max of per-element ds)
+            P_max: largest ROI side among all batch elements
+            P_c: coarse grid side = ceil(P_max / ds_common)
+        """
+        B = src_yx.shape[0]
+        geom = []
+        for b in range(B):
+            src        = src_yx[b].long()
+            tgts       = tgt_yx_k[b]
+            valid_mask = gt_dist_k[b] > 0
+            if valid_mask.any():
+                valid_tgts = tgts[valid_mask]
+                span_max   = int(torch.max(torch.abs(
+                    valid_tgts.float() - src.float())).item())
+            else:
+                span_max = 0
+            half = span_max + margin
+            P    = max(2 * half + 1, 64)
+            y0   = int(src[0].item()) - half
+            x0   = int(src[1].item()) - half
+            sr_y = max(0, min(int(src[0].item()) - y0, P - 1))
+            sr_x = max(0, min(int(src[1].item()) - x0, P - 1))
+            ds   = min_ds
+            geom.append((y0, x0, P, sr_y, sr_x, ds, valid_mask))
+
+        ds_common = max(g[5] for g in geom)
+        P_max     = max(g[2] for g in geom)
+        P_c       = int(_math.ceil(P_max / ds_common))
+        return geom, ds_common, P_max, P_c
+
+    def _build_roi_cost_and_src(
+        self,
+        road_prob: torch.Tensor,    # [B, H, W]
+        geom: list,
+        ds_pool: int,
+        P_target: int,
+    ):
+        """Crop, pad, pool road_prob into a batched cost map and source mask.
+
+        Returns:
+            cost_batch: [B, P_target, P_target]
+            src_mask:   [B, P_target, P_target] bool
+        """
+        B, H, W = road_prob.shape
+        device  = road_prob.device
+        costs_list = []
+        src_mask   = torch.zeros(B, P_target, P_target, dtype=torch.bool, device=device)
+
+        for b in range(B):
+            y0, x0, P, sr_y, sr_x, _ds_b, _valid_mask = geom[b]
+            y1, x1 = y0 + P, x0 + P
+            prob_b = road_prob[b]
+
+            yy0 = max(y0, 0); xx0 = max(x0, 0)
+            yy1 = min(y1, H); xx1 = min(x1, W)
+
+            patch = F.pad(
+                prob_b[yy0:yy1, xx0:xx1],
+                (xx0 - x0, x1 - xx1, yy0 - y0, y1 - yy1),
+                value=0.0,
+            )  # [P, P]
+
+            P_pad = int(_math.ceil(P / ds_pool) * ds_pool)
+            if P_pad > P:
+                patch = F.pad(patch, (0, P_pad - P, 0, P_pad - P), value=0.0)
+
+            patch_pooled = F.max_pool2d(
+                patch.unsqueeze(0).unsqueeze(0),
+                kernel_size=ds_pool, stride=ds_pool,
+            ).squeeze(0).squeeze(0)
+
+            ph, pw = patch_pooled.shape
+            if ph < P_target or pw < P_target:
+                patch_pooled = F.pad(patch_pooled,
+                                     (0, P_target - pw, 0, P_target - ph),
+                                     value=0.0)
+
+            costs_list.append(
+                self._road_prob_to_cost(patch_pooled).to(dtype=torch.float32))
+
+            sc_y = max(0, min(sr_y // ds_pool, P_target - 1))
+            sc_x = max(0, min(sr_x // ds_pool, P_target - 1))
+            src_mask[b, sc_y, sc_x] = True
+
+        cost_batch = torch.stack(costs_list)  # [B, P_target, P_target]
+        return cost_batch, src_mask
+
+    def _gather_target_dists(
+        self,
+        T_field: torch.Tensor,      # [B, Href, Wref]
+        geom: list,
+        tgt_yx_k: torch.Tensor,     # [B, K, 2]
+        ds: int,
+        P_grid: int,
+        large_val: float,
+        offsets: "list[tuple[int,int]] | None" = None,
+    ):
+        """Read K target T-values per batch element from a solved T field.
+
+        Args:
+            offsets: per-batch (y_off, x_off) into the full P_grid coordinate
+                     system (used by tube ROI). None means (0, 0) for all.
+
+        Returns:
+            T_eik:     [B, K] predicted distances
+            oob_count: number of targets that fell outside the field bounds
+        """
+        B = T_field.shape[0]
+        K = tgt_yx_k.shape[1]
+        device = T_field.device
+        oob_count = 0
+        all_dists: list = []
+
+        for b in range(B):
+            y0, x0, _P, _sr_y, _sr_x, _ds_b, valid_mask = geom[b]
+            T_b  = T_field[b]
+            Href, Wref = T_b.shape
+            yoff, xoff = offsets[b] if offsets is not None else (0, 0)
+            dists_b = []
+            for k in range(K):
+                if valid_mask[k]:
+                    ty = int(tgt_yx_k[b, k, 0].item())
+                    tx = int(tgt_yx_k[b, k, 1].item())
+                    gc_y = max(0, min((ty - y0) // ds, P_grid - 1)) - yoff
+                    gc_x = max(0, min((tx - x0) // ds, P_grid - 1)) - xoff
+                    if gc_y < 0 or gc_y >= Href or gc_x < 0 or gc_x >= Wref:
+                        oob_count += 1
+                        dists_b.append(torch.tensor(
+                            large_val, device=device, dtype=T_field.dtype))
+                    else:
+                        dists_b.append(T_b[gc_y, gc_x])
+                else:
+                    dists_b.append(torch.tensor(
+                        large_val, device=device, dtype=T_field.dtype))
+            all_dists.append(torch.stack(dists_b))
+
+        return torch.stack(all_dists), oob_count
+
+    # ------------------------------------------------------------------
     # Training: batched one-src → K-targets differentiable Eikonal solve
     # ------------------------------------------------------------------
 
@@ -2044,141 +2361,31 @@ class SAMRoute(SAMRoad):
         """
         Differentiable one-src → K-targets Eikonal solve for training.
 
-        Batched across the full batch B:
-          1. Compute per-element ROI geometry (P_b, ds_b) independently.
-          2. Use ds_common = max(ds_b) so all coarse grids share the same cell
-             size, enabling a single _eikonal_soft_sweeping_diff call on a
-             [B, P_c, P_c] tensor instead of B sequential calls.
-          3. Read K target T-values per element from the batched T field.
-
-        Elements with no valid targets are handled by a sentinel cost/src.
-
         Returns [B, K] tensor; padding positions hold cfg.large_val.
         """
         from dataclasses import replace as _replace
 
-        B, H, W = road_prob.shape
-        K       = tgt_yx_k.shape[1]
-        device  = road_prob.device
-        cfg     = eik_cfg if eik_cfg is not None else self.route_eik_cfg
-        margin  = self.route_roi_margin
-        min_ds  = max(1, int(getattr(self, 'route_eik_downsample', 4)))
-        n_iters = int(cfg.n_iters)
+        cfg       = eik_cfg if eik_cfg is not None else self.route_eik_cfg
+        margin    = self.route_roi_margin
+        min_ds    = max(1, int(getattr(self, 'route_eik_downsample', 4)))
         large_val = float(cfg.large_val)
 
-        # ------------------------------------------------------------------ #
-        # Pass 1: compute per-element ROI geometry                            #
-        # ------------------------------------------------------------------ #
-        geom = []   # list of (y0, x0, P, src_rel_y, src_rel_x, ds, valid_mask_b)
-        for b in range(B):
-            src        = src_yx[b].long()
-            tgts       = tgt_yx_k[b]
-            valid_mask = gt_dist_k[b] > 0
+        geom, ds_common, _P_max, P_c = self._compute_roi_geom(
+            src_yx, tgt_yx_k, gt_dist_k, margin, min_ds)
 
-            if valid_mask.any():
-                valid_tgts = tgts[valid_mask]
-                span_max   = int(torch.max(torch.abs(
-                    valid_tgts.float() - src.float())).item())
-            else:
-                span_max = 0
+        cost_batch, src_mask = self._build_roi_cost_and_src(
+            road_prob, geom, ds_common, P_c)
 
-            half = span_max + margin
-            P    = max(2 * half + 1, 64)
-            y0   = int(src[0].item()) - half
-            x0   = int(src[1].item()) - half
-            sr_y = max(0, min(int(src[0].item()) - y0, P - 1))
-            sr_x = max(0, min(int(src[1].item()) - x0, P - 1))
-            ds   = min_ds
-            geom.append((y0, x0, P, sr_y, sr_x, ds, valid_mask))
-
-        # ------------------------------------------------------------------ #
-        # Pass 2: common downsample factor and coarse-grid size               #
-        # ------------------------------------------------------------------ #
-        ds_common = max(g[5] for g in geom)
-        # P_c = coarse grid side length for the largest ROI
-        P_max = max(g[2] for g in geom)
-        P_c   = int(_math.ceil(P_max / ds_common))
-
-        # ------------------------------------------------------------------ #
-        # Pass 3: build batched cost [B, P_c, P_c] and src_mask [B, P_c, P_c]#
-        # ------------------------------------------------------------------ #
-        costs_list = []
-        src_mask   = torch.zeros(B, P_c, P_c, dtype=torch.bool, device=device)
-
-        for b in range(B):
-            y0, x0, P, sr_y, sr_x, _ds_b, valid_mask = geom[b]
-            y1, x1   = y0 + P, x0 + P
-            prob_b   = road_prob[b]
-
-            yy0 = max(y0, 0); xx0 = max(x0, 0)
-            yy1 = min(y1, H); xx1 = min(x1, W)
-
-            patch = F.pad(
-                prob_b[yy0:yy1, xx0:xx1],
-                (xx0 - x0, x1 - xx1, yy0 - y0, y1 - yy1),
-                value=0.0,
-            )  # [P, P]
-
-            # Pad P to a multiple of ds_common before pooling
-            P_pad = int(_math.ceil(P / ds_common) * ds_common)
-            if P_pad > P:
-                patch = F.pad(patch, (0, P_pad - P, 0, P_pad - P), value=0.0)
-
-            patch_c = F.max_pool2d(
-                patch.unsqueeze(0).unsqueeze(0), kernel_size=ds_common, stride=ds_common
-            ).squeeze(0).squeeze(0)  # [ceil(P/ds), ceil(P/ds)]
-
-            # Pad to the common P_c × P_c size (zero-cost = high cost after conversion)
-            ph, pw = patch_c.shape
-            if ph < P_c or pw < P_c:
-                patch_c = F.pad(patch_c, (0, P_c - pw, 0, P_c - ph), value=0.0)
-
-            costs_list.append(self._road_prob_to_cost(patch_c).to(dtype=torch.float32))  # [P_c, P_c]
-
-            sc_y = max(0, min(sr_y // ds_common, P_c - 1))
-            sc_x = max(0, min(sr_x // ds_common, P_c - 1))
-            src_mask[b, sc_y, sc_x] = True
-
-        cost_batch = torch.stack(costs_list)  # [B, P_c, P_c]
-
-        # ------------------------------------------------------------------ #
-        # Pass 4: single batched differentiable Eikonal solve                 #
-        # ------------------------------------------------------------------ #
         cfg_common = _replace(cfg, h=float(ds_common))
         T_all = _eikonal_soft_sweeping_diff(
-            cost_batch,
-            src_mask,
-            cfg_common,
+            cost_batch, src_mask, cfg_common,
             checkpoint_chunk=self.route_ckpt_chunk,
             gate_alpha=self.route_gate_alpha,
         )  # [B, P_c, P_c]
 
-        # ------------------------------------------------------------------ #
-        # Pass 5: read K target T-values per element                          #
-        # ------------------------------------------------------------------ #
-        all_dists: list = []
-        for b in range(B):
-            y0, x0, P, _sr_y, _sr_x, _ds_b, valid_mask = geom[b]
-            tgts    = tgt_yx_k[b]
-            T_b     = T_all[b]
+        T_eik, _ = self._gather_target_dists(
+            T_all, geom, tgt_yx_k, ds_common, P_c, large_val)
 
-            dists_b = []
-            for k in range(K):
-                if valid_mask[k]:
-                    ty = int(tgts[k, 0].item())
-                    tx = int(tgts[k, 1].item())
-                    tc_y = max(0, min((ty - y0) // ds_common, P_c - 1))
-                    tc_x = max(0, min((tx - x0) // ds_common, P_c - 1))
-                    dists_b.append(T_b[tc_y, tc_x])
-                else:
-                    dists_b.append(
-                        torch.tensor(large_val, device=device,
-                                     dtype=cost_batch.dtype))
-            all_dists.append(torch.stack(dists_b))
-
-        T_eik = torch.stack(all_dists)  # [B, K]
-
-        # Euclidean residual blending
         d_euc = ((src_yx.unsqueeze(1).float() - tgt_yx_k.float()) ** 2
                  ).sum(-1).sqrt()  # [B, K]
         return _mix_eikonal_euclid(T_eik, d_euc, self.eik_gate_logit)
@@ -2239,99 +2446,20 @@ class SAMRoute(SAMRoad):
         large_val = float(cfg.large_val)
 
         # -------------------------
-        # Pass 1: geometry per element
+        # Pass 1: geometry per element (shared helper)
         # -------------------------
-        geom = []
-        for b in range(B):
-            src        = src_yx[b].long()
-            tgts       = tgt_yx_k[b]
-            valid_mask = gt_dist_k[b] > 0
-            if valid_mask.any():
-                valid_tgts = tgts[valid_mask]
-                span_max   = int(torch.max(torch.abs(valid_tgts.float() - src.float())).item())
-            else:
-                span_max = 0
-            half = span_max + margin
-            P    = max(2 * half + 1, 64)
-            y0   = int(src[0].item()) - half
-            x0   = int(src[1].item()) - half
-            sr_y = max(0, min(int(src[0].item()) - y0, P - 1))
-            sr_x = max(0, min(int(src[1].item()) - x0, P - 1))
-            ds   = min_ds
-            geom.append((y0, x0, P, sr_y, sr_x, ds, valid_mask))
+        geom, ds_common, P_max, P_c = self._compute_roi_geom(
+            src_yx, tgt_yx_k, gt_dist_k, margin, min_ds)
 
-        ds_common = max(g[5] for g in geom)
         mg_factor = max(1, int(mg_factor))
         ds_coarse = max(1, int(ds_common * mg_factor))
-
-        P_max   = max(g[2] for g in geom)
-        P_c     = int(_math.ceil(P_max / ds_common))
-        P_c2    = int(_math.ceil(P_max / ds_coarse))
+        P_c2      = int(_math.ceil(P_max / ds_coarse))
 
         # -------------------------
-        # Pass 2: build fine cost/src_mask (B, P_c, P_c)
+        # Pass 2: build fine & coarse cost/src_mask (shared helper)
         # -------------------------
-        costs_f = []
-        src_f   = torch.zeros(B, P_c, P_c, dtype=torch.bool, device=device)
-
-        # and coarse cost/src_mask (B, P_c2, P_c2)
-        costs_c = []
-        src_c   = torch.zeros(B, P_c2, P_c2, dtype=torch.bool, device=device)
-
-        for b in range(B):
-            y0, x0, P, sr_y, sr_x, _ds_b, valid_mask = geom[b]
-            y1, x1 = y0 + P, x0 + P
-            prob_b = road_prob[b]
-
-            yy0 = max(y0, 0); xx0 = max(x0, 0)
-            yy1 = min(y1, H); xx1 = min(x1, W)
-
-            patch = F.pad(
-                prob_b[yy0:yy1, xx0:xx1],
-                (xx0 - x0, x1 - xx1, yy0 - y0, y1 - yy1),
-                value=0.0,
-            )  # [P, P]
-
-            # ---- fine pooling (ds_common) ----
-            P_pad_f = int(_math.ceil(P / ds_common) * ds_common)
-            patch_f = patch
-            if P_pad_f > P:
-                patch_f = F.pad(patch_f, (0, P_pad_f - P, 0, P_pad_f - P), value=0.0)
-
-            patch_f = F.max_pool2d(
-                patch_f.unsqueeze(0).unsqueeze(0), kernel_size=ds_common, stride=ds_common
-            ).squeeze(0).squeeze(0)
-
-            ph, pw = patch_f.shape
-            if ph < P_c or pw < P_c:
-                patch_f = F.pad(patch_f, (0, P_c - pw, 0, P_c - ph), value=0.0)
-
-            costs_f.append(self._road_prob_to_cost(patch_f).to(dtype=torch.float32))
-            sf_y = max(0, min(sr_y // ds_common, P_c - 1))
-            sf_x = max(0, min(sr_x // ds_common, P_c - 1))
-            src_f[b, sf_y, sf_x] = True
-
-            # ---- coarse pooling (ds_coarse) ----
-            P_pad_c = int(_math.ceil(P / ds_coarse) * ds_coarse)
-            patch_c = patch
-            if P_pad_c > P:
-                patch_c = F.pad(patch_c, (0, P_pad_c - P, 0, P_pad_c - P), value=0.0)
-
-            patch_c = F.max_pool2d(
-                patch_c.unsqueeze(0).unsqueeze(0), kernel_size=ds_coarse, stride=ds_coarse
-            ).squeeze(0).squeeze(0)
-
-            ph2, pw2 = patch_c.shape
-            if ph2 < P_c2 or pw2 < P_c2:
-                patch_c = F.pad(patch_c, (0, P_c2 - pw2, 0, P_c2 - ph2), value=0.0)
-
-            costs_c.append(self._road_prob_to_cost(patch_c).to(dtype=torch.float32))
-            sc_y = max(0, min(sr_y // ds_coarse, P_c2 - 1))
-            sc_x = max(0, min(sr_x // ds_coarse, P_c2 - 1))
-            src_c[b, sc_y, sc_x] = True
-
-        cost_f = torch.stack(costs_f)  # [B, P_c, P_c]
-        cost_c = torch.stack(costs_c)  # [B, P_c2, P_c2]
+        cost_f, src_f = self._build_roi_cost_and_src(road_prob, geom, ds_common, P_c)
+        cost_c, src_c = self._build_roi_cost_and_src(road_prob, geom, ds_coarse, P_c2)
 
         # Pre-compute fine/coarse grid coordinates for src and targets (needed by tube)
         src_f_yx = []   # [(sf_y, sf_x), ...] per batch
@@ -2579,32 +2707,12 @@ class SAMRoute(SAMRoad):
             pass
 
         # -------------------------
-        # Pass 5: read K targets (tube-offset-aware)
+        # Pass 5: read K targets (shared helper, tube-offset-aware)
         # -------------------------
-        oob_count = 0
-        all_dists: list = []
-        for b in range(B):
-            valid_mask = geom[b][6]
-            T_b  = T_ref[b]
-            Href, Wref = T_b.shape[0], T_b.shape[1]
-            yoff, xoff = off_f[b]
-            dists_b = []
-            for k in range(K):
-                if valid_mask[k]:
-                    tf = tgt_f_yx[b][k]
-                    if tf is None:
-                        dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
-                        continue
-                    ty = int(tf[0] - yoff)
-                    tx = int(tf[1] - xoff)
-                    if ty < 0 or ty >= Href or tx < 0 or tx >= Wref:
-                        oob_count += 1
-                        dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
-                        continue
-                    dists_b.append(T_b[ty, tx])
-                else:
-                    dists_b.append(torch.tensor(large_val, device=device, dtype=cost_ref.dtype))
-            all_dists.append(torch.stack(dists_b))
+        T_eik, oob_count = self._gather_target_dists(
+            T_ref, geom, tgt_yx_k, ds_common, P_c, large_val,
+            offsets=off_f,
+        )
 
         if use_tube:
             try:
@@ -2617,8 +2725,6 @@ class SAMRoute(SAMRoad):
                     f"[tube] {oob_count} target(s) fell outside tube bbox — "
                     f"bbox construction may have an alignment bug"
                 )
-
-        T_eik = torch.stack(all_dists)  # [B, K]
         d_euc = ((src_yx.unsqueeze(1).float() - tgt_yx_k.float()) ** 2).sum(-1).sqrt()  # [B, K]
         pred_dist = _mix_eikonal_euclid(T_eik, d_euc, self.eik_gate_logit)
 

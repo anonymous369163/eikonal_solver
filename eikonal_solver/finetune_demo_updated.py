@@ -67,6 +67,9 @@ class TrainConfig:
         self.ROAD_DICE_WEIGHT = 0.8
         self.ROAD_DUAL_TARGET = True
         self.ROAD_THIN_BOOST = 10.0
+        self.ROAD_FOCAL_LOSS = False
+        self.ROAD_FOCAL_ALPHA = 0.75
+        self.ROAD_FOCAL_GAMMA = 2.0
 
         self.ROUTE_LAMBDA_SEG = 1.0
         self.ROUTE_LAMBDA_DIST = 0.0
@@ -718,7 +721,9 @@ class SAMRouteGTMaskTeacher(SAMRoute):
 
     def _compute_dense_field_loss(self, batch: dict) -> torch.Tensor:
         """Compute dense distance field loss using stored field_meta from solver."""
-        field_meta = self._last_field_meta
+        if self._field_meta_step != self.global_step:
+            return torch.tensor(0.0, device=batch["road_mask"].device)
+        field_meta = self._field_meta_current_step
         if field_meta is None:
             return torch.tensor(0.0, device=batch["road_mask"].device)
 
@@ -761,7 +766,7 @@ class SAMRouteGTMaskTeacher(SAMRoute):
     def training_step(self, batch, batch_idx):
         if self.route_lambda_dist > 0 and ("src_yx" not in batch):
             batch = self._inject_dist(batch)
-        self._last_field_meta = None
+        self._field_meta_current_step = None
         loss = super().training_step(batch, batch_idx)
 
         if self._dense_field_loss and self._lambda_dist_field > 0:
@@ -772,7 +777,7 @@ class SAMRouteGTMaskTeacher(SAMRoute):
             self.log("train_field_loss", loss_field, on_step=True, on_epoch=False, prog_bar=True)
             self.log("field_loss_weighted", field_contrib, on_step=True, on_epoch=False)
 
-        self._last_field_meta = None
+        self._field_meta_current_step = None
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -811,6 +816,13 @@ def train(args):
         config.ROAD_DICE_WEIGHT = args.road_dice_weight
     if args.road_thin_boost is not None:
         config.ROAD_THIN_BOOST = args.road_thin_boost
+    if args.road_focal_loss:
+        config.ROAD_FOCAL_LOSS = True
+        print(f"Focal Loss enabled (alpha={config.ROAD_FOCAL_ALPHA}, gamma={config.ROAD_FOCAL_GAMMA})")
+    if args.road_focal_alpha is not None:
+        config.ROAD_FOCAL_ALPHA = args.road_focal_alpha
+    if args.road_focal_gamma is not None:
+        config.ROAD_FOCAL_GAMMA = args.road_focal_gamma
     if args.smooth_decoder:
         config.USE_SMOOTH_DECODER = True
         print("平滑 Decoder 已启用（末端 3×3 Conv 抗马赛克）")
@@ -1064,6 +1076,9 @@ def parse_args():
     p.add_argument("--road_pos_weight", type=float, default=None, help="BCE 正样本权重")
     p.add_argument("--road_dice_weight", type=float, default=None, help="Dice 损失权重，越大越强调细路")
     p.add_argument("--road_thin_boost", type=float, default=None, help="BCE 细路像素额外权重倍数 (默认 6.0)")
+    p.add_argument("--road_focal_loss", action="store_true", help="Use Focal Loss instead of weighted BCE")
+    p.add_argument("--road_focal_alpha", type=float, default=None, help="Focal Loss alpha (class balance)")
+    p.add_argument("--road_focal_gamma", type=float, default=None, help="Focal Loss gamma (focusing)")
     p.add_argument("--run_name", type=str, default=None, help="参数扫描时指定，checkpoint 保存为 best_{run_name}.ckpt")
     # LoRA encoder 微调
     p.add_argument("--encoder_lora", action="store_true", help="开启 LoRA 微调 Encoder")

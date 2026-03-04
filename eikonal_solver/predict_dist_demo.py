@@ -1,17 +1,10 @@
-"""
-Predict distance using the trained model.
-""" 
-
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Minimal distance prediction (call-only, no duplicated defs).
+Predict N×N distance matrix using trained SAMRoute model.
 
 Usage:
-  python predict_distance_minimal_callonly.py \
+  python predict_dist_demo.py \
     --tif  /path/to/crop_xxx.tif \
     --ckpt /path/to/best.ckpt \
     --nodes "100,120;200,300;350,400" \
@@ -39,15 +32,46 @@ from gradcheck_route_loss_v2_multigrid_fullmap import (
     _detect_smooth_decoder,
     _detect_patch_size,
     _load_rgb_from_tif,
-    _maxpool_prob,
-    _mix_eikonal_euclid,
     GradcheckConfig,
 )
 
-# 直接复用你已有的函数：不要在本文件重复定义
-# 方案 A：如果你保留在 eval_ranking_accuracy.py 里，就这样 import
-from eval_ranking_accuracy import _avgpool_prob, _solve_all_sources_once
 
+# ---------------------------------------------------------------------------
+# Thin wrapper — delegates to model.forward_distance_matrix
+# ---------------------------------------------------------------------------
+
+def predict_distance_matrix(
+    model: SAMRoute,
+    road_prob_t: torch.Tensor,
+    nodes_yx: torch.Tensor,
+    *,
+    ds: int = 16,
+    mg_f: int = 4,
+    eik_iters: int = 40,
+    pool_mode: str = "max",
+    iter_floor_c: float = 1.2,
+    iter_floor_f: float = 0.65,
+) -> torch.Tensor:
+    """Differentiable N×N distance matrix prediction.
+
+    Thin wrapper around ``model.forward_distance_matrix`` for backward
+    compatibility.  See :meth:`SAMRoute.forward_distance_matrix` for details.
+    """
+    return model.forward_distance_matrix(
+        nodes_yx,
+        road_prob=road_prob_t,
+        ds=ds,
+        mg_factor=mg_f,
+        eik_iters=eik_iters,
+        pool_mode=pool_mode,
+        iter_floor_c=iter_floor_c,
+        iter_floor_f=iter_floor_f,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Node parser
+# ---------------------------------------------------------------------------
 
 def _parse_nodes(nodes_str: str) -> np.ndarray:
     """Parse 'y,x;y,x;...' -> (N,2) int64, yx pixel coords."""
@@ -59,11 +83,16 @@ def _parse_nodes(nodes_str: str) -> np.ndarray:
     return np.asarray(yx, dtype=np.int64)
 
 
-@torch.no_grad()
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tif", type=str, required=True)
     ap.add_argument("--ckpt", type=str, required=True)
+    ap.add_argument("--tsp_load_ckpt", type=str, default="",
+                    help="Routing checkpoint (alpha/gamma/gate). Overridden by --gate/--alpha/--gamma if >= 0.")
     ap.add_argument("--nodes", type=str, required=True,
                     help='Nodes: "y,x;y,x;..." in pixel coords.')
     ap.add_argument("--out", type=str, default="/tmp/D.npy")
@@ -71,19 +100,33 @@ def main():
     ap.add_argument("--ds", type=int, default=16)
     ap.add_argument("--eik_iters", type=int, default=40)
     ap.add_argument("--pool_mode", type=str, default="max", choices=["max", "avg"])
-    ap.add_argument("--gate", type=float, default=1.0, help="0..1, 1=pure Eikonal")
-    ap.add_argument("--alpha", type=float, default=50.0)
-    ap.add_argument("--gamma", type=float, default=2.0)
+    ap.add_argument("--gate", type=float, default=1.0,
+                    help="0..1, 1=pure Eikonal. -1=use checkpoint value.")
+    ap.add_argument("--alpha", type=float, default=50.0,
+                    help="Cost alpha. -1=use checkpoint value.")
+    ap.add_argument("--gamma", type=float, default=2.0,
+                    help="Cost gamma. -1=use checkpoint value.")
+    ap.add_argument("--cost_net", action="store_true")
+    ap.add_argument("--cost_net_ch", type=int, default=16)
     ap.add_argument("--iter_floor_c", type=float, default=1.2)
     ap.add_argument("--iter_floor_f", type=float, default=0.65)
     args = ap.parse_args()
 
     device = torch.device(args.device)
-    nodes_yx = _parse_nodes(args.nodes)
 
-    # ---- load model ----
+    # ---- load checkpoint & auto-detect config ----
     sd = _load_lightning_ckpt(args.ckpt)
     cfg = GradcheckConfig()
+
+    has_lora = any("attn.qkv.linear_a_q" in k or "attn.qkv.linear_a_v" in k for k in sd)
+    if has_lora:
+        cfg.ENCODER_LORA = True
+        cfg.FREEZE_ENCODER = False
+        for k, v in sd.items():
+            if "linear_a_q.weight" in k:
+                cfg.LORA_RANK = v.shape[0]
+                break
+
     cfg.USE_SMOOTH_DECODER = _detect_smooth_decoder(sd)
     ps = _detect_patch_size(sd)
     if ps is not None:
@@ -91,87 +134,84 @@ def main():
     cfg.ROUTE_EIK_ITERS = int(args.eik_iters)
     cfg.ROUTE_EIK_DOWNSAMPLE = int(args.ds)
 
+    if args.cost_net:
+        cfg.ROUTE_COST_NET = True
+        cfg.ROUTE_COST_NET_CH = args.cost_net_ch
+
+    if "block_log_alpha" in sd or "block_th_logit" in sd:
+        cfg.LEARNABLE_BLOCK = True
+
     model = SAMRoute(cfg).to(device)
     model.load_state_dict(sd, strict=False)
-    model.eval()
-
     for p in model.image_encoder.parameters():
         p.requires_grad_(False)
 
-    # ---- override routing params (optional) ----
-    with torch.no_grad():
-        g = float(np.clip(args.gate, 0.0, 1.0))
-        if g >= 0.9999:
-            logit = 10.0
-        elif g <= 1e-6:
-            logit = -10.0
-        else:
-            logit = math.log(g / max(1.0 - g, 1e-9))
-        model.eik_gate_logit.fill_(logit)
-        model.cost_log_alpha.fill_(math.log(float(args.alpha)))
-        model.cost_log_gamma.fill_(math.log(float(args.gamma)))
+    # ---- load routing checkpoint (optional) ----
+    if args.tsp_load_ckpt and os.path.isfile(args.tsp_load_ckpt):
+        rckpt = torch.load(args.tsp_load_ckpt, map_location=device, weights_only=False)
+        with torch.no_grad():
+            if "cost_log_alpha" in rckpt:
+                model.cost_log_alpha.copy_(rckpt["cost_log_alpha"].to(device))
+            if "cost_log_gamma" in rckpt:
+                model.cost_log_gamma.copy_(rckpt["cost_log_gamma"].to(device))
+            if "eik_gate_logit" in rckpt:
+                model.eik_gate_logit.copy_(rckpt["eik_gate_logit"].to(device))
+        if "cost_net_state_dict" in rckpt and getattr(model, "cost_net", None) is not None:
+            model.cost_net.load_state_dict(rckpt["cost_net_state_dict"])
+        print(f"[loaded] routing ckpt: {args.tsp_load_ckpt}")
 
+    # ---- apply parameter overrides (eval-aligned: -1 = keep checkpoint value) ----
+    with torch.no_grad():
+        if args.gate >= 0:
+            logit = 10.0 if args.gate >= 0.9999 else math.log(
+                args.gate / max(1.0 - args.gate, 1e-9))
+            model.eik_gate_logit.fill_(logit)
+            print(f"[override] gate={args.gate:.4f} (logit={logit:.2f})")
+        if args.alpha > 0:
+            model.cost_log_alpha.fill_(math.log(args.alpha))
+            print(f"[override] alpha={args.alpha:.1f}")
+        if args.gamma > 0:
+            model.cost_log_gamma.fill_(math.log(args.gamma))
+            print(f"[override] gamma={args.gamma:.2f}")
+
+    model.eval()
     model.route_gate_alpha = 0.8
 
-    # ---- load image ----
+    # ---- load image & infer road_prob ----
     rgb = _load_rgb_from_tif(args.tif)
     H, W = rgb.shape[:2]
+    print(f"[tif] {args.tif}  shape={H}x{W}")
 
-    # ---- infer road_prob ----
-    road_prob_np = sliding_window_inference(rgb, model, device, patch_size=int(cfg.PATCH_SIZE)).astype(np.float32)
-    road_prob_t = torch.from_numpy(road_prob_np).to(device, torch.float32).unsqueeze(0).clamp(1e-6, 1.0 - 1e-6)
+    road_prob_np = sliding_window_inference(
+        rgb, model, device, patch_size=int(cfg.PATCH_SIZE),
+    ).astype(np.float32)
+    road_prob_t = torch.from_numpy(road_prob_np).to(
+        device, torch.float32,
+    ).unsqueeze(0).clamp(1e-6, 1.0 - 1e-6)
 
-    # ---- build cost maps ----
-    ds = int(args.ds)
-    mg_f = 4
-    pool_fn = _avgpool_prob if args.pool_mode == "avg" else _maxpool_prob
+    # ---- predict distance matrix via model.forward_distance_matrix ----
+    nodes_yx = _parse_nodes(args.nodes)
+    nodes_t = torch.from_numpy(nodes_yx).to(device, torch.long)
 
-    prob_f, _, _ = pool_fn(road_prob_t, ds)
-    cost_f = model._road_prob_to_cost(prob_f)[0].to(torch.float32)  # [Hf,Wf]
+    with torch.no_grad():
+        D = model.forward_distance_matrix(
+            nodes_t,
+            road_prob=road_prob_t,
+            ds=int(args.ds),
+            eik_iters=int(args.eik_iters),
+            pool_mode=args.pool_mode,
+            iter_floor_c=args.iter_floor_c,
+            iter_floor_f=args.iter_floor_f,
+        )
 
-    prob_c, _, _ = pool_fn(road_prob_t, ds * mg_f)
-    cost_c = model._road_prob_to_cost(prob_c)[0].to(torch.float32)  # [Hc,Wc]
+    D_np = D.cpu().numpy().astype(np.float32)
 
-    # ---- solve all sources once ----
-    nodes_yx[:, 0] = np.clip(nodes_yx[:, 0], 0, H - 1)
-    nodes_yx[:, 1] = np.clip(nodes_yx[:, 1], 0, W - 1)
-    all_src_yx = torch.from_numpy(nodes_yx).to(device, torch.long)  # [N,2]
-
-    mg_itc = max(20, int(args.eik_iters * 0.25))
-    mg_itf = max(20, int(args.eik_iters * 0.80))
-
-    T_maps = _solve_all_sources_once(
-        model, cost_f, cost_c, all_src_yx,
-        model.route_eik_cfg, ds, mg_f, mg_itc, mg_itf, device,
-        iter_floor_c=args.iter_floor_c,
-        iter_floor_f=args.iter_floor_f,
-    )  # [N,Hf,Wf]
-
-    # ---- lookup to build NxN distance matrix ----
-    N = nodes_yx.shape[0]
-    Hf, Wf = cost_f.shape[-2], cost_f.shape[-1]
-    tgt_fc = (all_src_yx // ds).clamp(min=0)
-    tgt_fc[:, 0] = tgt_fc[:, 0].clamp(0, Hf - 1)
-    tgt_fc[:, 1] = tgt_fc[:, 1].clamp(0, Wf - 1)
-
-    D_eik = torch.empty((N, N), device=device, dtype=torch.float32)
-    for i in range(N):
-        D_eik[i] = T_maps[i, tgt_fc[:, 0], tgt_fc[:, 1]]
-
-    # Euclidean for optional mix
-    y = nodes_yx[:, 0].astype(np.float32)
-    x = nodes_yx[:, 1].astype(np.float32)
-    dy = y[:, None] - y[None, :]
-    dx = x[:, None] - x[None, :]
-    D_euc = np.sqrt(dy * dy + dx * dx).astype(np.float32)
-
-    D = _mix_eikonal_euclid(D_eik, torch.from_numpy(D_euc).to(device), model.eik_gate_logit)
-    D = D.detach().cpu().numpy().astype(np.float32)
-    np.fill_diagonal(D, 0.0)
-
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    np.save(args.out, D)
-    print(f"[saved] {args.out}  shape={D.shape}  min/mean/max={D.min():.3f}/{D.mean():.3f}/{D.max():.3f}")
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    np.save(args.out, D_np)
+    print(f"[saved] {args.out}  shape={D_np.shape}  "
+          f"min/mean/max={D_np.min():.3f}/{D_np.mean():.3f}/{D_np.max():.3f}")
 
 
 if __name__ == "__main__":
