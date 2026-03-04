@@ -825,7 +825,7 @@ def _mix_eikonal_euclid(
     d_euc: torch.Tensor,
     gate_logit: torch.Tensor,
     gate_min: float = 0.3,
-    gate_max: float = 0.95,
+    gate_max: float = 1.0,
 ) -> torch.Tensor:
     """Blend Eikonal T-values with Euclidean distances via learnable gate.
 

@@ -272,6 +272,8 @@ def main():
     if args.cost_net:
         cfg.ROUTE_COST_NET = True
         cfg.ROUTE_COST_NET_CH = args.cost_net_ch
+    if "block_log_alpha" in sd or "block_th_logit" in sd:
+        cfg.LEARNABLE_BLOCK = True
 
     model = SAMRoute(cfg).to(device)
     model.load_state_dict(sd, strict=False)

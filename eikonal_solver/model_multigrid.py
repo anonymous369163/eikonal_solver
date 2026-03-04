@@ -742,6 +742,18 @@ from eikonal import (
 )
 
 
+def _logit_of(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    """Inverse of scaled sigmoid: maps x in (lo, hi) to logit in (-inf, inf)."""
+    t = (x - lo) / (hi - lo)
+    t = max(1e-6, min(1 - 1e-6, t))
+    return _math.log(t / (1.0 - t))
+
+
+def _scaled_sigmoid(logit, lo: float = 0.0, hi: float = 1.0):
+    """Scaled sigmoid: maps logit to (lo, hi)."""
+    return lo + (hi - lo) * torch.sigmoid(logit)
+
+
 def _prob_to_cost_smooth(
     prob: torch.Tensor,
     gamma: float = 3.0,
@@ -850,7 +862,7 @@ def _mix_eikonal_euclid(
     d_euc: torch.Tensor,
     gate_logit: torch.Tensor,
     gate_min: float = 0.3,
-    gate_max: float = 0.95,
+    gate_max: float = 1.0,
 ) -> torch.Tensor:
     """Blend Eikonal T-values with Euclidean distances via learnable gate.
 
@@ -1199,6 +1211,13 @@ class SAMRoute(SAMRoad):
             torch.tensor(_math.log(max(_gamma_init, 1e-3))))
         self.route_add_block_alpha  = float(_cfg(config, "ROUTE_ADD_BLOCK_ALPHA",   50.0))
         self.route_add_block_smooth = float(_cfg(config, "ROUTE_ADD_BLOCK_SMOOTH",  50.0))
+        # block_th / block_alpha: optionally learnable (student only; teacher always uses fixed values)
+        self._learnable_block = bool(_cfg(config, "LEARNABLE_BLOCK", False))
+        if self._learnable_block:
+            self.block_log_alpha = torch.nn.Parameter(
+                torch.tensor(_math.log(max(self.route_add_block_alpha, 1e-3))))
+            self.block_th_logit = torch.nn.Parameter(
+                torch.tensor(_logit_of(self.route_block_th, lo=0.01, hi=0.30)))
         self.route_eps              = float(_cfg(config, "ROUTE_EPS",               1e-6))
         self.route_eik_cfg = EikonalConfig(
             n_iters     = int(_cfg(config, "ROUTE_EIK_ITERS", 200)),
@@ -1240,6 +1259,13 @@ class SAMRoute(SAMRoad):
         self.route_tube_pad_c          = int(_cfg(config,  "ROUTE_TUBE_PAD_C",          4))
         self.route_tube_max_area_ratio = float(_cfg(config, "ROUTE_TUBE_MAX_AREA_RATIO", 0.90))
         self.route_tube_min_side       = int(_cfg(config,  "ROUTE_TUBE_MIN_SIDE",       16))
+
+        # --- Dense distance field loss (optional) ---
+        self._dense_field_loss       = bool(_cfg(config, "DENSE_FIELD_LOSS", False))
+        self._lambda_dist_field      = float(_cfg(config, "LAMBDA_DIST_FIELD", 0.2))
+        self._dense_field_min_pixels = int(_cfg(config, "DENSE_FIELD_MIN_PIXELS", 10))
+        self._dense_field_cap_factor = float(_cfg(config, "DENSE_FIELD_CAP_FACTOR", 0.85))
+        self._last_field_meta        = None
 
         # --- Neural residual cost net (optional; adds spatial context to prob->cost) ---
         self.route_cost_net             = bool(_cfg(config, "ROUTE_COST_NET", False))
@@ -1384,12 +1410,19 @@ class SAMRoute(SAMRoad):
                 _math.log(5.0), _math.log(100.0)).exp()
             gamma = self.cost_log_gamma.clamp(
                 _math.log(0.5), _math.log(4.0)).exp()
+            if self._learnable_block:
+                _blk_alpha = self.block_log_alpha.clamp(
+                    _math.log(5.0), _math.log(200.0)).exp()
+                _blk_th = _scaled_sigmoid(self.block_th_logit, lo=0.01, hi=0.30)
+            else:
+                _blk_alpha = self.route_add_block_alpha
+                _blk_th = self.route_block_th
             base_cost = _prob_to_cost_additive(
                 road_prob,
                 alpha        = alpha,
                 gamma        = gamma,
-                block_th     = self.route_block_th,
-                block_alpha  = self.route_add_block_alpha,
+                block_th     = _blk_th,
+                block_alpha  = _blk_alpha,
                 block_smooth = self.route_add_block_smooth,
                 eps          = self.route_eps,
             )
@@ -1737,7 +1770,8 @@ class SAMRoute(SAMRoad):
                     n = int(eik_cfg.n_iters)
                     itc = self.route_mg_iters_coarse if self.route_mg_iters_coarse > 0 else max(20, int(n * 0.25))
                     itf = self.route_mg_iters_fine   if self.route_mg_iters_fine   > 0 else max(20, int(n * 0.80))
-                    pred_dist_raw = self._roi_multi_target_multigrid_diff_solve(
+                    _want_field = self._dense_field_loss and self._lambda_dist_field > 0
+                    _solve_out = self._roi_multi_target_multigrid_diff_solve(
                         road_prob, src_yx, tgt_yx, gt_dist, eik_cfg,
                         mg_factor=self.route_mg_factor,
                         mg_iters_coarse=itc,
@@ -1750,7 +1784,12 @@ class SAMRoute(SAMRoad):
                         tube_pad_c=self.route_tube_pad_c,
                         tube_max_area_ratio=self.route_tube_max_area_ratio,
                         tube_min_side=self.route_tube_min_side,
+                        return_field=_want_field,
                     )
+                    if _want_field:
+                        pred_dist_raw, self._last_field_meta = _solve_out
+                    else:
+                        pred_dist_raw = _solve_out
                 else:
                     pred_dist_raw = self._roi_multi_target_diff_solve(
                         road_prob, src_yx, tgt_yx, gt_dist, eik_cfg)  # [B, K]
@@ -1788,6 +1827,12 @@ class SAMRoute(SAMRoad):
                 self.log("cost_alpha", _a, on_step=False, on_epoch=True)
                 self.log("cost_gamma", _g, on_step=False, on_epoch=True)
                 self.log("eik_gate", _gate, on_step=False, on_epoch=True)
+                if self._learnable_block:
+                    _ba = self.block_log_alpha.clamp(
+                        _math.log(5.0), _math.log(200.0)).exp()
+                    _bt = _scaled_sigmoid(self.block_th_logit, lo=0.01, hi=0.30)
+                    self.log("block_alpha", _ba, on_step=False, on_epoch=True)
+                    self.log("block_th", _bt, on_step=False, on_epoch=True)
 
             with torch.no_grad():
                 valid_pred = pred_dist_raw[valid] if valid.any() else pred_dist_raw.flatten()[:1]
@@ -1935,21 +1980,54 @@ class SAMRoute(SAMRoad):
             })
 
         if self.route_lambda_dist > 0:
+            freeze_cost = bool(getattr(self.config, "FREEZE_COST_PARAMS", False))
+            cost_lr_scale = float(getattr(self.config, "COST_PARAM_LR_SCALE", 1.0))
             eik_params = [self.cost_log_alpha, self.cost_log_gamma,
                           self.eik_gate_logit]
-            param_dicts.append({
-                'params': eik_params,
-                'lr': self.config.BASE_LR,
-            })
+            if self._learnable_block:
+                eik_params += [self.block_log_alpha, self.block_th_logit]
+            if freeze_cost:
+                for p in eik_params:
+                    p.requires_grad = False
+                print("[SAMRoute] Cost params FROZEN (alpha/gamma/gate not trainable)")
+            else:
+                eik_lr = self.config.BASE_LR * cost_lr_scale
+                param_dicts.append({
+                    'params': eik_params,
+                    'lr': eik_lr,
+                })
+                if cost_lr_scale != 1.0:
+                    print(f"[SAMRoute] Cost params lr_scale={cost_lr_scale} -> lr={eik_lr:.2e}")
 
         for i, pd in enumerate(param_dicts):
             print(f'[SAMRoute] param group {i}: {sum(p.numel() for p in pd["params"])} params')
 
         optimizer = torch.optim.Adam(param_dicts, lr=self.config.BASE_LR)
-        milestones = list(self.config.get("LR_MILESTONES", [150]))
-        step_lr   = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=milestones, gamma=0.1)
-        return {'optimizer': optimizer, 'lr_scheduler': step_lr}
+
+        sched_type = getattr(self.config, "LR_SCHEDULER", "multistep")
+        warmup_epochs = int(getattr(self.config, "LR_WARMUP_EPOCHS", 0))
+        lr_min = float(getattr(self.config, "LR_MIN", 1e-6))
+
+        if sched_type == "cosine":
+            import math
+            T_max = max(self.trainer.max_epochs - warmup_epochs, 1)
+            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=T_max, eta_min=lr_min)
+            if warmup_epochs > 0:
+                warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.01, total_iters=warmup_epochs)
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup_sched, cosine_sched],
+                    milestones=[warmup_epochs])
+            else:
+                scheduler = cosine_sched
+        else:
+            milestones = list(self.config.get("LR_MILESTONES", [150]))
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer, milestones=milestones, gamma=0.1)
+
+        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     # ------------------------------------------------------------------
     # Training: batched one-src → K-targets differentiable Eikonal solve
@@ -2116,6 +2194,7 @@ class SAMRoute(SAMRoad):
         *,
         mg_factor: int = 4,
         mg_iters_coarse: int = 40,
+        return_field: bool = False,
         mg_iters_fine: int = 40,
         mg_detach_coarse: bool = False,
         mg_interp: str = "bilinear",
@@ -2541,7 +2620,22 @@ class SAMRoute(SAMRoad):
 
         T_eik = torch.stack(all_dists)  # [B, K]
         d_euc = ((src_yx.unsqueeze(1).float() - tgt_yx_k.float()) ** 2).sum(-1).sqrt()  # [B, K]
-        return _mix_eikonal_euclid(T_eik, d_euc, self.eik_gate_logit)
+        pred_dist = _mix_eikonal_euclid(T_eik, d_euc, self.eik_gate_logit)
+
+        if not return_field:
+            return pred_dist
+
+        field_meta = {
+            "T_pred": T_ref,
+            "geom": geom,
+            "off_f": off_f,
+            "ds_common": ds_common,
+            "P_c": P_c,
+            "tube_h": int(T_ref.shape[1]),
+            "tube_w": int(T_ref.shape[2]),
+            "src_f_yx": src_f_yx,
+        }
+        return pred_dist, field_meta
 
     # ------------------------------------------------------------------
     # Inference: one source → many targets (single Eikonal solve)

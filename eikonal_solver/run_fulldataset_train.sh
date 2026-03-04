@@ -123,7 +123,9 @@ seg_lora)
     ;;
 
 # ------------------------------------------------------------------
-# 5) Seg + Dist joint + LoRA encoder (both losses + encoder adapts)
+# 5) Seg + Dist joint + LoRA encoder (stabilised)
+#    Grad clip + cosine LR + frozen cost params
+#    LR: cosine annealing with 3-epoch warmup, 2e-4 -> 1e-6
 # ------------------------------------------------------------------
 seg_dist_lora)
     OUTPUT_DIR="training_outputs/fulldataset_seg_dist_lora"
@@ -141,14 +143,18 @@ seg_dist_lora)
         --output_dir             "$OUTPUT_DIR" \
         --run_name               "$RUN_NAME" \
         --lr                     2e-4 \
+        --lr_scheduler           cosine \
+        --lr_warmup_epochs       3 \
+        --lr_min                 1e-6 \
         --encoder_lora \
         --lora_rank              4 \
-        --lambda_dist            0.2 \
+        --lambda_dist            0.05 \
         --dist_supervision       gtmask_random \
-        --dist_k_targets         8 \
+        --dist_k_targets         4 \
         --dist_src_onroad_p      0.9 \
         --dist_tgt_onroad_p      0.9 \
         --dist_min_euclid_px     64 \
+        --dist_max_euclid_px     192 \
         --dist_teacher_alpha     20.0 \
         --dist_teacher_gamma     2.0 \
         --dist_teacher_mask      thick \
@@ -157,7 +163,10 @@ seg_dist_lora)
         --multigrid \
         --eik_iters              40 \
         --eik_downsample         16 \
-        --mg_factor              4
+        --mg_factor              4 \
+        --ckpt_chunk             20 \
+        --grad_clip              1.0 \
+        --freeze_cost_params
     ;;
 
 *)

@@ -100,6 +100,10 @@ class TrainConfig:
         self.ROUTE_MG_DETACH_COARSE = False
 
         self.LR_MILESTONES = [150]
+        self.LR_SCHEDULER = "multistep"   # "multistep" | "cosine"
+        self.LR_WARMUP_EPOCHS = 0
+        self.LR_MIN = 1e-6
+        self.LEARNABLE_BLOCK = False
 
     def get(self, key, default):
         return getattr(self, key, default)
@@ -130,6 +134,7 @@ def _precompute_gt_dist_for_patch(
     src_onroad_p: float = 0.9,
     tgt_onroad_p: float = 0.9,
     min_euclid_px: int = 64,
+    max_euclid_px: int = 0,
     teacher_alpha: float = 20.0,
     teacher_gamma: float = 2.0,
     eik_iters: int = 200,
@@ -174,7 +179,10 @@ def _precompute_gt_dist_for_patch(
     cand_yx = torch.cat(cand_parts, dim=0) if len(cand_parts) > 1 else cand_parts[0]
 
     d = torch.norm(cand_yx.float() - src_yx.float(), dim=1)
-    good = cand_yx[d >= float(min_euclid_px)]
+    mask_d = d >= float(min_euclid_px)
+    if max_euclid_px > 0:
+        mask_d = mask_d & (d <= float(max_euclid_px))
+    good = cand_yx[mask_d]
     if good.numel() == 0:
         good = cand_yx
     take = min(k, good.shape[0])
@@ -441,6 +449,7 @@ class SAMRouteGTMaskTeacher(SAMRoute):
         src_onroad_p: float = 0.9,
         tgt_onroad_p: float = 0.9,
         min_euclid_px: int = 64,
+        max_euclid_px: int = 0,
         teacher_iters=None,
         teacher_alpha: float = 20.0,
         teacher_gamma: float = 2.0,
@@ -454,6 +463,7 @@ class SAMRouteGTMaskTeacher(SAMRoute):
         self._src_onroad_p = float(src_onroad_p)
         self._tgt_onroad_p = float(tgt_onroad_p)
         self._min_euclid_px = int(min_euclid_px)
+        self._max_euclid_px = int(max_euclid_px)
         self._teacher_iters = int(teacher_iters) if teacher_iters is not None else None
         self._teacher_alpha = float(teacher_alpha)
         self._teacher_gamma = float(teacher_gamma)
@@ -516,7 +526,10 @@ class SAMRouteGTMaskTeacher(SAMRoute):
             cand_yx = torch.cat(cand, dim=0) if len(cand) > 1 else cand[0]
 
             d = torch.norm(cand_yx.to(torch.float32) - src.to(torch.float32), dim=1)
-            good = cand_yx[d >= float(self._min_euclid_px)]
+            mask_d = d >= float(self._min_euclid_px)
+            if self._max_euclid_px > 0:
+                mask_d = mask_d & (d <= float(self._max_euclid_px))
+            good = cand_yx[mask_d]
             if good.numel() == 0:
                 good = cand_yx  # fallback: allow close pairs
             take = min(k, good.shape[0])
@@ -573,6 +586,110 @@ class SAMRouteGTMaskTeacher(SAMRoute):
         gt = torch.gather(Tflat, 1, lin)
         return gt
 
+    def _teacher_gt_field_on_roi(
+        self,
+        road_mask: torch.Tensor,       # [B, H, W]  full-res GT road mask
+        field_meta: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hard-eval Eikonal on GT mask cropped to the SAME ROI as student.
+
+        Replicates the exact ROI crop, padding, and pooling that the student
+        solver used, ensuring domain-identical boundary conditions.
+
+        Returns:
+            T_gt:         [B, tube_h, tube_w]  teacher distance field
+            road_mask_ds: [B, tube_h, tube_w]  bool, downsampled GT road mask
+        """
+        device = road_mask.device
+        B, H, W = road_mask.shape
+        geom       = field_meta["geom"]
+        off_f      = field_meta["off_f"]
+        ds_common  = int(field_meta["ds_common"])
+        P_c        = int(field_meta["P_c"])
+        tube_h     = int(field_meta["tube_h"])
+        tube_w     = int(field_meta["tube_w"])
+        src_f_yx   = field_meta["src_f_yx"]
+        eps        = float(self._prob_eps)
+
+        n_iters = int(self._teacher_iters) if self._teacher_iters is not None else int(self.route_eik_cfg.n_iters)
+
+        T_gt_list = []
+        road_ds_list = []
+
+        for b in range(B):
+            y0, x0, P, sr_y, sr_x, _ds_b, _valid_mask = geom[b]
+            y1, x1 = y0 + P, x0 + P
+
+            mask_b = road_mask[b].to(torch.float32)
+            yy0 = max(y0, 0); xx0 = max(x0, 0)
+            yy1 = min(y1, H); xx1 = min(x1, W)
+
+            patch = F.pad(
+                mask_b[yy0:yy1, xx0:xx1],
+                (xx0 - x0, x1 - xx1, yy0 - y0, y1 - yy1),
+                value=0.0,
+            )
+
+            P_pad_f = int(np.ceil(P / ds_common) * ds_common)
+            if P_pad_f > P:
+                patch = F.pad(patch, (0, P_pad_f - P, 0, P_pad_f - P), value=0.0)
+
+            patch_ds = F.max_pool2d(
+                patch.unsqueeze(0).unsqueeze(0), kernel_size=ds_common, stride=ds_common
+            ).squeeze(0).squeeze(0)
+
+            ph, pw = patch_ds.shape
+            if ph < P_c or pw < P_c:
+                patch_ds = F.pad(patch_ds, (0, P_c - pw, 0, P_c - ph), value=0.0)
+
+            road_ds_full = (patch_ds > 0.5)
+
+            yoff, xoff = off_f[b]
+            road_roi = road_ds_full[yoff:yoff + tube_h, xoff:xoff + tube_w]
+            dh = tube_h - road_roi.shape[0]
+            dw = tube_w - road_roi.shape[1]
+            if dh > 0 or dw > 0:
+                road_roi = F.pad(road_roi.float(), (0, dw, 0, dh), value=0.0).bool()
+
+            prob_roi = road_roi.float().clamp(eps, 1.0 - eps)
+            cost_roi = _prob_to_cost_additive(
+                prob_roi.unsqueeze(0),
+                alpha=float(self._teacher_alpha),
+                gamma=float(self._teacher_gamma),
+                block_th=float(self.route_block_th),
+                block_alpha=float(self.route_add_block_alpha),
+                block_smooth=float(self.route_add_block_smooth),
+                eps=float(self.route_eps),
+            ).to(dtype=torch.float32).squeeze(0)
+
+            sf_y, sf_x = src_f_yx[b]
+            sf_y_roi = sf_y - yoff
+            sf_x_roi = sf_x - xoff
+            sf_y_roi = max(0, min(sf_y_roi, tube_h - 1))
+            sf_x_roi = max(0, min(sf_x_roi, tube_w - 1))
+
+            src_mask_b = torch.zeros(1, tube_h, tube_w, dtype=torch.bool, device=device)
+            src_mask_b[0, sf_y_roi, sf_x_roi] = True
+
+            actual_iters = max(n_iters, int(max(tube_h, tube_w) * 1.5))
+            cfg_t = dc_replace(
+                self.route_eik_cfg,
+                h=float(ds_common),
+                n_iters=actual_iters,
+                mode="hard_eval",
+                monotone=True,
+            )
+
+            with torch.no_grad():
+                T_b = eikonal_soft_sweeping(cost_roi.unsqueeze(0), src_mask_b, cfg_t).squeeze(0)
+
+            T_gt_list.append(T_b)
+            road_ds_list.append(road_roi)
+
+        T_gt = torch.stack(T_gt_list)
+        road_mask_ds = torch.stack(road_ds_list)
+        return T_gt, road_mask_ds
+
     def _inject_dist(self, batch: dict) -> dict:
         road_mask = batch["road_mask"]
         if self._teacher_mask == "thin" and ("road_mask_thin" in batch):
@@ -599,10 +716,64 @@ class SAMRouteGTMaskTeacher(SAMRoute):
         batch["gt_dist"] = torch.where(valid, gt_dist, torch.full_like(gt_dist, -1.0))
         return batch
 
+    def _compute_dense_field_loss(self, batch: dict) -> torch.Tensor:
+        """Compute dense distance field loss using stored field_meta from solver."""
+        field_meta = self._last_field_meta
+        if field_meta is None:
+            return torch.tensor(0.0, device=batch["road_mask"].device)
+
+        road_mask = batch["road_mask"]
+        if self._teacher_mask == "thin" and ("road_mask_thin" in batch):
+            road_mask = batch["road_mask_thin"]
+
+        T_pred = field_meta["T_pred"]
+        T_gt, road_ds = self._teacher_gt_field_on_roi(road_mask, field_meta)
+
+        B = T_pred.shape[0]
+        large_val = float(getattr(self.route_eik_cfg, "large_val", 1e6))
+        ds_common = int(field_meta["ds_common"])
+        cap_px = float(max(field_meta["tube_h"], field_meta["tube_w"]) * ds_common) * self._dense_field_cap_factor
+        min_pix = self._dense_field_min_pixels
+
+        all_pred, all_gt = [], []
+        n_valid_samples = 0
+        for b in range(B):
+            M = road_ds[b] & (T_gt[b] < large_val * 0.9) & (T_gt[b] < cap_px)
+            n_valid = int(M.sum().item())
+            if n_valid < min_pix:
+                continue
+            tp = T_pred[b][M]
+            tg = T_gt[b][M]
+            tp_max = tp.max().detach() + 1e-6
+            tg_max = tg.max() + 1e-6
+            all_pred.append(tp / tp_max)
+            all_gt.append(tg / tg_max)
+            n_valid_samples += 1
+
+        if not all_pred:
+            return torch.tensor(0.0, device=road_mask.device)
+
+        loss_field = F.huber_loss(
+            torch.cat(all_pred), torch.cat(all_gt).detach(), delta=2.0
+        )
+        return loss_field
+
     def training_step(self, batch, batch_idx):
         if self.route_lambda_dist > 0 and ("src_yx" not in batch):
             batch = self._inject_dist(batch)
-        return super().training_step(batch, batch_idx)
+        self._last_field_meta = None
+        loss = super().training_step(batch, batch_idx)
+
+        if self._dense_field_loss and self._lambda_dist_field > 0:
+            loss_field = self._compute_dense_field_loss(batch)
+            lam_f = self._effective_lambda_dist() / max(self.route_lambda_dist, 1e-9) * self._lambda_dist_field if self.route_lambda_dist > 0 else self._lambda_dist_field
+            field_contrib = lam_f * loss_field
+            loss = loss + field_contrib
+            self.log("train_field_loss", loss_field, on_step=True, on_epoch=False, prog_bar=True)
+            self.log("field_loss_weighted", field_contrib, on_step=True, on_epoch=False)
+
+        self._last_field_meta = None
+        return loss
 
     def validation_step(self, batch, batch_idx):
         if self.route_lambda_dist > 0 and ("src_yx" not in batch):
@@ -659,6 +830,31 @@ def train(args):
         config.ROUTE_MULTIGRID = True
     if args.mg_factor is not None:
         config.ROUTE_MG_FACTOR = args.mg_factor
+    if args.ckpt_chunk is not None:
+        config.ROUTE_CKPT_CHUNK = args.ckpt_chunk
+
+    # LR scheduler config
+    config.LR_SCHEDULER = args.lr_scheduler
+    config.LR_WARMUP_EPOCHS = args.lr_warmup_epochs
+    config.LR_MIN = args.lr_min
+
+    # Cost param stability
+    config.FREEZE_COST_PARAMS = args.freeze_cost_params
+    config.COST_PARAM_LR_SCALE = args.cost_param_lr_scale
+
+    # Learnable block params
+    config.LEARNABLE_BLOCK = args.learnable_block
+    if args.learnable_block:
+        print("Learnable block params enabled: block_th and block_alpha will be trained")
+
+    # Dense field loss config
+    config.DENSE_FIELD_LOSS = args.dense_field_loss
+    config.LAMBDA_DIST_FIELD = args.lambda_dist_field
+    config.DENSE_FIELD_MIN_PIXELS = args.dense_field_min_pixels
+    config.DENSE_FIELD_CAP_FACTOR = args.dense_field_cap_factor
+    if args.dense_field_loss:
+        print(f"Dense field loss enabled: lambda_dist_field={args.lambda_dist_field}, "
+              f"min_pixels={args.dense_field_min_pixels}, cap_factor={args.dense_field_cap_factor}")
 
     if args.dist_supervision == "gtmask_random" and config.ROUTE_LAMBDA_DIST <= 0.0:
         # Avoid silently disabling the feature due to a missing flag.
@@ -679,6 +875,7 @@ def train(args):
             src_onroad_p=args.dist_src_onroad_p,
             tgt_onroad_p=args.dist_tgt_onroad_p,
             min_euclid_px=args.dist_min_euclid_px,
+            max_euclid_px=args.dist_max_euclid_px,
             teacher_iters=args.dist_teacher_iters,
             teacher_alpha=args.dist_teacher_alpha,
             teacher_gamma=args.dist_teacher_gamma,
@@ -717,6 +914,15 @@ def train(args):
     else:
         print(f"⚠️ 未找到预训练权重 {PRETRAINED_CKPT}，从随机 Decoder 开始训练。")
 
+    # Override cost params to inference-optimal values when frozen
+    if config.FREEZE_COST_PARAMS and config.ROUTE_LAMBDA_DIST > 0:
+        import math as _m
+        with torch.no_grad():
+            model.cost_log_alpha.fill_(_m.log(50.0))
+            model.cost_log_gamma.fill_(_m.log(2.0))
+            model.eik_gate_logit.fill_(10.0)  # sigmoid(10) ≈ 1.0
+        print(f"[freeze_cost] Set alpha=50.0, gamma=2.0, gate≈1.0 (frozen)")
+
     # 2. 构建 DataLoader (自动路由：单图测试 或 全量训练)
     # Build dist_cache_cfg when gtmask_random + dist cache enabled
     dist_cache_cfg = None
@@ -728,6 +934,7 @@ def train(args):
             src_onroad_p=args.dist_src_onroad_p,
             tgt_onroad_p=args.dist_tgt_onroad_p,
             min_euclid_px=args.dist_min_euclid_px,
+            max_euclid_px=args.dist_max_euclid_px,
             teacher_alpha=args.dist_teacher_alpha,
             teacher_gamma=args.dist_teacher_gamma,
             eik_iters=args.dist_teacher_iters or config.ROUTE_EIK_ITERS,
@@ -792,7 +999,12 @@ def train(args):
     precision = "16-mixed" if use_gpu else "32"
     strategy = "ddp" if use_ddp else "auto"
     
-    trainer = pl.Trainer(
+    accum = args.accumulate_grad_batches
+    eff_batch = args.batch_size * accum * (devices if isinstance(devices, int) else len(devices))
+    if accum > 1:
+        print(f"Gradient accumulation: {accum} steps, effective batch size = {eff_batch}")
+
+    trainer_kwargs = dict(
         max_epochs=args.epochs,
         accelerator="gpu" if use_gpu else "cpu",
         devices=devices,
@@ -800,11 +1012,17 @@ def train(args):
         precision=precision,
         logger=tb_logger,
         callbacks=[checkpoint_callback, lr_monitor],
-        log_every_n_steps=10 if args.single_region_dir else 50, # 单图模式打印勤一点
-        val_check_interval=1.0, # 每epoch验证一次
+        log_every_n_steps=10 if args.single_region_dir else 50,
+        val_check_interval=1.0,
         enable_progress_bar=True,
         enable_model_summary=False,
+        accumulate_grad_batches=accum,
     )
+    if args.grad_clip is not None and args.grad_clip > 0:
+        trainer_kwargs["gradient_clip_val"] = args.grad_clip
+        trainer_kwargs["gradient_clip_algorithm"] = "norm"
+        print(f"Gradient clipping enabled: max_norm={args.grad_clip}")
+    trainer = pl.Trainer(**trainer_kwargs)
     
     if use_ddp:
         print(f"使用 {devices} 张 GPU 进行 DDP 分布式训练")
@@ -868,6 +1086,8 @@ def parse_args():
                    help="For gtmask_random: probability to sample targets on GT road pixels.")
     p.add_argument("--dist_min_euclid_px", type=int, default=64,
                    help="For gtmask_random: enforce target Euclid distance >= this (fallback if impossible).")
+    p.add_argument("--dist_max_euclid_px", type=int, default=0,
+                   help="For gtmask_random: enforce target Euclid distance <= this. 0 = no limit.")
     p.add_argument("--dist_teacher_iters", type=int, default=None,
                    help="For gtmask_random: teacher hard-eval Eikonal iters (default = ROUTE_EIK_ITERS).")
     p.add_argument("--dist_teacher_alpha", type=float, default=20.0,
@@ -900,6 +1120,38 @@ def parse_args():
                    help="Disable multigrid Eikonal")
     p.add_argument("--mg_factor", type=int, default=None,
                    help="Multigrid coarse-to-fine factor (default 4)")
+    p.add_argument("--ckpt_chunk", type=int, default=None,
+                   help="Gradient checkpoint chunk size for Eikonal solver (default 10)")
+    # Dense distance field loss
+    p.add_argument("--dense_field_loss", action="store_true",
+                   help="Enable dense distance field loss (compare full T_pred vs T_gt on road pixels).")
+    p.add_argument("--lambda_dist_field", type=float, default=0.2,
+                   help="Weight for dense field loss (default 0.2).")
+    p.add_argument("--dense_field_min_pixels", type=int, default=10,
+                   help="Skip dense field loss if fewer than this many valid pixels in ROI.")
+    p.add_argument("--dense_field_cap_factor", type=float, default=0.85,
+                   help="Cap for T_gt in dense field loss: ROI_size * factor.")
+    # LR scheduler
+    p.add_argument("--lr_scheduler", type=str, default="multistep",
+                   choices=["multistep", "cosine"],
+                   help="LR scheduler type: 'multistep' or 'cosine' (cosine annealing with optional warmup).")
+    p.add_argument("--lr_warmup_epochs", type=int, default=0,
+                   help="Linear warmup epochs before cosine decay (only for --lr_scheduler cosine).")
+    p.add_argument("--lr_min", type=float, default=1e-6,
+                   help="Minimum learning rate for cosine annealing.")
+    # Gradient clipping & accumulation
+    p.add_argument("--grad_clip", type=float, default=None,
+                   help="Global gradient norm clipping value (e.g. 1.0). None = disabled.")
+    p.add_argument("--accumulate_grad_batches", type=int, default=1,
+                   help="Accumulate gradients over N batches to simulate larger effective batch size.")
+    # Cost param stability
+    p.add_argument("--freeze_cost_params", action="store_true",
+                   help="Freeze Eikonal cost params (alpha/gamma/gate). Uses init values, no gradient.")
+    p.add_argument("--cost_param_lr_scale", type=float, default=1.0,
+                   help="LR multiplier for cost params (alpha/gamma/gate). E.g. 0.01 = 100x slower. Ignored if --freeze_cost_params.")
+    # Learnable block params
+    p.add_argument("--learnable_block", action="store_true",
+                   help="Make block_th and block_alpha learnable parameters in the cost function.")
     args = p.parse_args()
     args.preload_to_ram = not args.no_preload
     args.use_cached_features = args.use_cached_features and not args.no_cached_features
