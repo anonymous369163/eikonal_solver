@@ -3,14 +3,17 @@
 """
 Predict N×N distance matrix using trained SAMRoute model.
 
-Usage:
+Usage (manual nodes):
   python predict_dist_demo.py \
-    --tif  /path/to/crop_xxx.tif \
-    --ckpt /path/to/best.ckpt \
     --nodes "100,120;200,300;350,400" \
-    --out /tmp/D.npy \
-    --ds 16 \
-    --device cuda
+    --out /tmp/D.npy
+
+Usage (NPZ auto-detect, 20 nodes, case 0):
+  python predict_dist_demo.py
+
+Usage (NPZ with options):
+  python predict_dist_demo.py --p_count 50 --case_idx 3
+  python predict_dist_demo.py --npz /path/to/xxx_p50.npz --case_idx 5
 """
 
 import argparse
@@ -32,6 +35,8 @@ from gradcheck_route_loss_v2_multigrid_fullmap import (
     _detect_smooth_decoder,
     _detect_patch_size,
     _load_rgb_from_tif,
+    _load_npz_nodes,
+    _normxy_to_yx,
     GradcheckConfig,
 )
 
@@ -89,12 +94,37 @@ def _parse_nodes(nodes_str: str) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tif", type=str, required=True)
-    ap.add_argument("--ckpt", type=str, required=True)
+    _default_tif = os.path.normpath(os.path.join(
+        _HERE,
+        "..",
+        "Gen_dataset_V2",
+        "Gen_dataset",
+        "19.940688_110.276704",
+        "00_20.021516_110.190699_3000.0",
+        "crop_20.021516_110.190699_3000.0_z16.tif",
+    ))
+    ap.add_argument("--tif", type=str, default=_default_tif,
+                    help="TIF image path (default: 19.940688_110.276704/00_20.021516_110.190699_3000.0)")
+    _default_ckpt = os.path.normpath(os.path.join(
+        _HERE,
+        "..",
+        "training_outputs",
+        "fulldataset_seg_dist_lora_v2",
+        "checkpoints",
+        "best_seg_dist_lora_v2.ckpt",
+    ))
+    ap.add_argument("--ckpt", type=str, default=_default_ckpt,
+                    help=f"Model checkpoint (default: fulldataset_seg_dist_lora_v2)")
     ap.add_argument("--tsp_load_ckpt", type=str, default="",
                     help="Routing checkpoint (alpha/gamma/gate). Overridden by --gate/--alpha/--gamma if >= 0.")
-    ap.add_argument("--nodes", type=str, required=True,
-                    help='Nodes: "y,x;y,x;..." in pixel coords.')
+    ap.add_argument("--nodes", type=str, default="",
+                    help='Nodes: "y,x;y,x;..." in pixel coords. If empty, loads from NPZ.')
+    ap.add_argument("--npz", type=str, default="",
+                    help="NPZ file path. Auto-derived from --tif if not given.")
+    ap.add_argument("--p_count", type=int, default=20,
+                    help="Node count variant (20 or 50) for NPZ filename.")
+    ap.add_argument("--case_idx", type=int, default=0,
+                    help="Case index within NPZ file.")
     ap.add_argument("--out", type=str, default="/tmp/D.npy")
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--ds", type=int, default=16)
@@ -189,9 +219,25 @@ def main():
         device, torch.float32,
     ).unsqueeze(0).clamp(1e-6, 1.0 - 1e-6)
 
-    # ---- predict distance matrix via model.forward_distance_matrix ----
-    nodes_yx = _parse_nodes(args.nodes)
+    # ---- load nodes ----
+    gt_dist = None
+    if args.nodes:
+        nodes_yx = _parse_nodes(args.nodes)
+    else:
+        if args.npz:
+            npz_path = args.npz
+        else:
+            tif_name = os.path.basename(args.tif)
+            location_key = tif_name.replace("crop_", "").replace("_z16.tif", "").replace(".tif", "")
+            npz_name = f"distance_dataset_all_{location_key}_p{args.p_count}.npz"
+            npz_path = os.path.join(os.path.dirname(args.tif), npz_name)
+        coords, udist, H_npz, W_npz = _load_npz_nodes(npz_path)
+        print(f"[npz] {npz_path}  cases={coords.shape[0]}  nodes={coords.shape[1]}")
+        nodes_yx = _normxy_to_yx(coords[args.case_idx], H, W)
+        gt_dist = (udist[args.case_idx] * float(H)).astype(np.float32)
+
     nodes_t = torch.from_numpy(nodes_yx).to(device, torch.long)
+    print(f"[nodes] N={nodes_t.shape[0]}  source={'--nodes' if args.nodes else 'NPZ'}")
 
     with torch.no_grad():
         D = model.forward_distance_matrix(
@@ -212,6 +258,12 @@ def main():
     np.save(args.out, D_np)
     print(f"[saved] {args.out}  shape={D_np.shape}  "
           f"min/mean/max={D_np.min():.3f}/{D_np.mean():.3f}/{D_np.max():.3f}")
+
+    if gt_dist is not None:
+        mask = ~np.eye(gt_dist.shape[0], dtype=bool) & np.isfinite(gt_dist) & (gt_dist > 0)
+        if mask.any():
+            rel_err = np.abs(D_np[mask] - gt_dist[mask]) / np.maximum(gt_dist[mask], 1.0)
+            print(f"[vs GT] rel_error: mean={rel_err.mean():.4f}  median={np.median(rel_err):.4f}")
 
 
 if __name__ == "__main__":

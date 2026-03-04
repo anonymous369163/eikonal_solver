@@ -1039,6 +1039,49 @@ def train(args):
     if use_ddp:
         print(f"使用 {devices} 张 GPU 进行 DDP 分布式训练")
 
+    # ---- save training config for reproducibility ----
+    import json, datetime
+    train_hparams = {
+        "run_name": args.run_name,
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "pretrained_ckpt": os.path.basename(PRETRAINED_CKPT),
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "devices": devices,
+        "workers": args.workers,
+        "lr": config.BASE_LR,
+        "lr_scheduler": config.LR_SCHEDULER,
+        "lr_warmup_epochs": config.LR_WARMUP_EPOCHS,
+        "lr_min": config.LR_MIN,
+        "encoder_lora": config.ENCODER_LORA,
+        "lora_rank": config.LORA_RANK,
+        "road_pos_weight": config.ROAD_POS_WEIGHT,
+        "road_dice_weight": config.ROAD_DICE_WEIGHT,
+        "road_dual_target": config.ROAD_DUAL_TARGET,
+        "road_thin_boost": config.ROAD_THIN_BOOST,
+        "road_focal_loss": config.ROAD_FOCAL_LOSS,
+        "road_focal_alpha": config.ROAD_FOCAL_ALPHA,
+        "road_focal_gamma": config.ROAD_FOCAL_GAMMA,
+        "lambda_dist": config.ROUTE_LAMBDA_DIST,
+        "dist_supervision": args.dist_supervision,
+        "eik_iters": config.ROUTE_EIK_ITERS,
+        "eik_downsample": config.ROUTE_EIK_DOWNSAMPLE,
+        "multigrid": config.ROUTE_MULTIGRID,
+        "mg_factor": config.ROUTE_MG_FACTOR,
+        "grad_clip": args.grad_clip,
+        "freeze_cost_params": config.FREEZE_COST_PARAMS,
+        "accumulate_grad_batches": accum,
+        "single_region_dir": args.single_region_dir,
+        "data_root": args.data_root,
+        "val_fraction": args.val_fraction,
+        "samples_per_region": args.samples_per_region,
+    }
+    config_path = os.path.join(output_dir, "train_config.json")
+    with open(config_path, "w") as f:
+        json.dump(train_hparams, f, indent=2, ensure_ascii=False)
+    print(f"[config] saved: {config_path}")
+    tb_logger.log_hyperparams(train_hparams)
+
     print("\n🚀 开始训练...")
     trainer.fit(model, train_loader, val_loader)
     print(f"\n✅ 训练完成。最佳权重已保存在: {ckpt_dir}")
