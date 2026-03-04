@@ -222,6 +222,11 @@ def main():
                      help="Eikonal iteration hint (actual count controlled by iter_floor).")
     ap.add_argument("--cost_net", action="store_true")
     ap.add_argument("--cost_net_ch", type=int, default=16)
+    ap.add_argument("--cost_net_use_coord", action="store_true")
+    ap.add_argument("--cost_net_use_grad", action="store_true")
+    ap.add_argument("--cost_net_delta_scale", type=float, default=0.75)
+    ap.add_argument("--cost_net_arch", type=str, default="basic", choices=["basic", "multiscale"])
+    ap.add_argument("--cost_net_gate", type=str, default="none", choices=["none", "sigmoid"])
     ap.add_argument("--p_count", type=int, default=20,
                      help="Node count variant: 20 or 50 (selects matching NPZ)")
     ap.add_argument("--cache_prob", type=str, default="")
@@ -272,6 +277,11 @@ def main():
     if args.cost_net:
         cfg.ROUTE_COST_NET = True
         cfg.ROUTE_COST_NET_CH = args.cost_net_ch
+        cfg.ROUTE_COST_NET_USE_COORD = bool(args.cost_net_use_coord)
+        cfg.ROUTE_COST_NET_USE_GRAD  = bool(args.cost_net_use_grad)
+        cfg.ROUTE_COST_NET_DELTA_SCALE = float(args.cost_net_delta_scale)
+        cfg.ROUTE_COST_NET_ARCH = str(args.cost_net_arch)
+        cfg.ROUTE_COST_NET_GATE = str(args.cost_net_gate)
     if "block_log_alpha" in sd or "block_th_logit" in sd:
         cfg.LEARNABLE_BLOCK = True
 

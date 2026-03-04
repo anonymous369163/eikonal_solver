@@ -79,6 +79,13 @@ class TrainConfig:
         # neural residual cost net (disabled by default for finetune)
         self.ROUTE_COST_NET = False
         self.ROUTE_COST_NET_CH = 8
+        self.ROUTE_COST_NET_USE_COORD = False
+        self.ROUTE_COST_NET_USE_GRAD  = False
+        self.ROUTE_COST_NET_DELTA_SCALE = 0.75
+        self.ROUTE_COST_NET_ARCH = "basic"   # basic | multiscale
+        self.ROUTE_COST_NET_GATE = "none"    # none | sigmoid
+        self.LAMBDA_COST_REG = 0.0
+        self.LAMBDA_COST_TV = 0.0
 
         # Eikonal solver configuration (active when ROUTE_LAMBDA_DIST > 0)
         # Aligned with eval/test SWEEP-tuned optimal values
@@ -145,7 +152,7 @@ def _precompute_gt_dist_for_patch(
     gt_cap_factor: float = 0.85,
     detour_cap: float = 12.0,
     prob_eps: float = 1e-4,
-    large_val: float = 1e6,
+    large_val: float = 1e4,
     teacher_mask_thin: np.ndarray | None = None,
     use_thin: bool = False,
 ) -> dict:
@@ -707,7 +714,7 @@ class SAMRouteGTMaskTeacher(SAMRoute):
             dim=-1,
         ).clamp_min(1.0)
         cap_px = float(road_mask.shape[-1]) * float(self._gt_cap_factor)
-        large_val = float(getattr(self.route_eik_cfg, "large_val", 1e6))
+        large_val = float(getattr(self.route_eik_cfg, "large_val", 1e4))
         valid = (
             (gt_dist > 0)
             & (gt_dist < cap_px)
@@ -735,7 +742,7 @@ class SAMRouteGTMaskTeacher(SAMRoute):
         T_gt, road_ds = self._teacher_gt_field_on_roi(road_mask, field_meta)
 
         B = T_pred.shape[0]
-        large_val = float(getattr(self.route_eik_cfg, "large_val", 1e6))
+        large_val = float(getattr(self.route_eik_cfg, "large_val", 1e4))
         ds_common = int(field_meta["ds_common"])
         cap_px = float(max(field_meta["tube_h"], field_meta["tube_w"]) * ds_common) * self._dense_field_cap_factor
         min_pix = self._dense_field_min_pixels
@@ -814,6 +821,8 @@ def train(args):
         config.ROAD_POS_WEIGHT = args.road_pos_weight
     if args.road_dice_weight is not None:
         config.ROAD_DICE_WEIGHT = args.road_dice_weight
+    if args.road_dual_target is not None:
+        config.ROAD_DUAL_TARGET = bool(args.road_dual_target)
     if args.road_thin_boost is not None:
         config.ROAD_THIN_BOOST = args.road_thin_boost
     if args.road_focal_loss:
@@ -836,6 +845,12 @@ def train(args):
         config.ROUTE_EIK_MODE = args.eik_mode
     if args.cap_mode is not None:
         config.ROUTE_CAP_MODE = args.cap_mode
+    if args.route_dist_warmup_steps is not None:
+        config.ROUTE_DIST_WARMUP_STEPS = int(args.route_dist_warmup_steps)
+    if args.route_eik_warmup_epochs is not None:
+        config.ROUTE_EIK_WARMUP_EPOCHS = int(args.route_eik_warmup_epochs)
+    if args.route_eik_iters_min is not None:
+        config.ROUTE_EIK_ITERS_MIN = int(args.route_eik_iters_min)
     if args.no_multigrid:
         config.ROUTE_MULTIGRID = False
     if args.multigrid:
@@ -844,6 +859,16 @@ def train(args):
         config.ROUTE_MG_FACTOR = args.mg_factor
     if args.ckpt_chunk is not None:
         config.ROUTE_CKPT_CHUNK = args.ckpt_chunk
+    # Optional residual cost net controls
+    config.ROUTE_COST_NET = bool(args.cost_net)
+    config.ROUTE_COST_NET_CH = int(args.cost_net_ch)
+    config.ROUTE_COST_NET_USE_COORD = bool(args.cost_net_use_coord)
+    config.ROUTE_COST_NET_USE_GRAD  = bool(args.cost_net_use_grad)
+    config.ROUTE_COST_NET_DELTA_SCALE = float(args.cost_net_delta_scale)
+    config.ROUTE_COST_NET_ARCH = str(args.cost_net_arch)
+    config.ROUTE_COST_NET_GATE = str(args.cost_net_gate)
+    config.LAMBDA_COST_REG = float(args.lambda_cost_reg)
+    config.LAMBDA_COST_TV = float(args.lambda_cost_tv)
 
     # LR scheduler config
     config.LR_SCHEDULER = args.lr_scheduler
@@ -1070,6 +1095,15 @@ def train(args):
         "mg_factor": config.ROUTE_MG_FACTOR,
         "grad_clip": args.grad_clip,
         "freeze_cost_params": config.FREEZE_COST_PARAMS,
+        "cost_net": config.ROUTE_COST_NET,
+        "cost_net_ch": config.ROUTE_COST_NET_CH,
+        "cost_net_use_coord": config.ROUTE_COST_NET_USE_COORD,
+        "cost_net_use_grad":  config.ROUTE_COST_NET_USE_GRAD,
+        "cost_net_delta_scale": config.ROUTE_COST_NET_DELTA_SCALE,
+        "cost_net_arch": config.ROUTE_COST_NET_ARCH,
+        "cost_net_gate": config.ROUTE_COST_NET_GATE,
+        "lambda_cost_reg": config.LAMBDA_COST_REG,
+        "lambda_cost_tv": config.LAMBDA_COST_TV,
         "accumulate_grad_batches": accum,
         "single_region_dir": args.single_region_dir,
         "data_root": args.data_root,
@@ -1118,6 +1152,10 @@ def parse_args():
     # 参数扫描：ROAD_POS_WEIGHT / ROAD_DICE_WEIGHT / ROAD_THIN_BOOST
     p.add_argument("--road_pos_weight", type=float, default=None, help="BCE 正样本权重")
     p.add_argument("--road_dice_weight", type=float, default=None, help="Dice 损失权重，越大越强调细路")
+    p.add_argument("--road_dual_target", dest="road_dual_target", action="store_true", default=None,
+                   help="Enable dual-target training: BCE on thick mask + Dice on thin mask.")
+    p.add_argument("--no_road_dual_target", dest="road_dual_target", action="store_false",
+                   help="Disable dual-target training: both BCE and Dice use thick mask.")
     p.add_argument("--road_thin_boost", type=float, default=None, help="BCE 细路像素额外权重倍数 (默认 6.0)")
     p.add_argument("--road_focal_loss", action="store_true", help="Use Focal Loss instead of weighted BCE")
     p.add_argument("--road_focal_alpha", type=float, default=None, help="Focal Loss alpha (class balance)")
@@ -1171,6 +1209,12 @@ def parse_args():
     p.add_argument("--cap_mode", type=str, default=None,
                    choices=["tanh", "clamp", "none"],
                    help="Distance cap mode (default tanh)")
+    p.add_argument("--route_dist_warmup_steps", type=int, default=None,
+                   help="Override ROUTE_DIST_WARMUP_STEPS (default 500).")
+    p.add_argument("--route_eik_warmup_epochs", type=int, default=None,
+                   help="Override ROUTE_EIK_WARMUP_EPOCHS (default 5).")
+    p.add_argument("--route_eik_iters_min", type=int, default=None,
+                   help="Override ROUTE_EIK_ITERS_MIN (default 15).")
     # Multigrid Eikonal (coarse→fine warm-start, aligned with eval/test)
     p.add_argument("--multigrid", action="store_true", default=None,
                    help="Enable multigrid Eikonal (default ON)")
@@ -1180,6 +1224,27 @@ def parse_args():
                    help="Multigrid coarse-to-fine factor (default 4)")
     p.add_argument("--ckpt_chunk", type=int, default=None,
                    help="Gradient checkpoint chunk size for Eikonal solver (default 10)")
+    # Residual cost net
+    p.add_argument("--cost_net", action="store_true",
+                   help="Enable neural residual cost net on road_prob.")
+    p.add_argument("--cost_net_ch", type=int, default=8,
+                   help="Residual cost net channel width.")
+    p.add_argument("--cost_net_use_coord", action="store_true",
+                   help="Append normalized XY coordinates as extra channels to cost net input.")
+    p.add_argument("--cost_net_use_grad", action="store_true",
+                   help="Append Sobel gradient magnitude |∇road_prob| as extra channel (highlights road edges/breakpoints).")
+    p.add_argument("--cost_net_delta_scale", type=float, default=0.75,
+                   help="Scale for bounded log-cost residual delta.")
+    p.add_argument("--cost_net_arch", type=str, default="basic",
+                   choices=["basic", "multiscale"],
+                   help="Residual cost net architecture.")
+    p.add_argument("--cost_net_gate", type=str, default="none",
+                   choices=["none", "sigmoid"],
+                   help="Residual output gating mode.")
+    p.add_argument("--lambda_cost_reg", type=float, default=0.0,
+                   help="L2 + zero-mean regularization weight for residual cost net output.")
+    p.add_argument("--lambda_cost_tv", type=float, default=0.0,
+                   help="Total-variation regularization weight for residual cost net output.")
     # Dense distance field loss
     p.add_argument("--dense_field_loss", action="store_true",
                    help="Enable dense distance field loss (compare full T_pred vs T_gt on road pixels).")

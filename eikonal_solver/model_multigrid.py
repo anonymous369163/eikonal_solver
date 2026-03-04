@@ -224,6 +224,48 @@ class ResidualCostNet(torch.nn.Module):
         return self.net(x)
 
 
+class ResidualCostNetMultiScaleLite(torch.nn.Module):
+    """Tiny FPN/U-Net-like residual head with two down/up stages."""
+
+    def __init__(self, in_ch: int = 1, mid_ch: int = 8):
+        super().__init__()
+        c1 = int(mid_ch)
+        c2 = int(mid_ch * 2)
+        c3 = int(mid_ch * 3)
+        self.enc1 = torch.nn.Sequential(
+            torch.nn.Conv2d(in_ch, c1, kernel_size=3, padding=1),
+            torch.nn.GELU(),
+            torch.nn.Conv2d(c1, c1, kernel_size=3, padding=1),
+            torch.nn.GELU(),
+        )
+        self.down1 = torch.nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1)
+        self.enc2 = torch.nn.Sequential(
+            torch.nn.GELU(),
+            torch.nn.Conv2d(c2, c2, kernel_size=3, padding=1),
+            torch.nn.GELU(),
+        )
+        self.down2 = torch.nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1)
+        self.bottleneck = torch.nn.Sequential(
+            torch.nn.GELU(),
+            torch.nn.Conv2d(c3, c3, kernel_size=3, padding=1),
+            torch.nn.GELU(),
+        )
+        self.up2 = torch.nn.Conv2d(c3 + c2, c2, kernel_size=3, padding=1)
+        self.up1 = torch.nn.Conv2d(c2 + c1, c1, kernel_size=3, padding=1)
+        self.out = torch.nn.Conv2d(c1, 1, kernel_size=1, bias=False)
+        torch.nn.init.zeros_(self.out.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.enc1(x)
+        x2 = self.enc2(self.down1(x1))
+        x3 = self.bottleneck(self.down2(x2))
+        u2 = F.interpolate(x3, size=x2.shape[-2:], mode="bilinear", align_corners=False)
+        u2 = F.gelu(self.up2(torch.cat([u2, x2], dim=1)))
+        u1 = F.interpolate(u2, size=x1.shape[-2:], mode="bilinear", align_corners=False)
+        u1 = F.gelu(self.up1(torch.cat([u1, x1], dim=1)))
+        return self.out(u1)
+
+
 class SAMRoad(pl.LightningModule):
     """This is the RelationFormer module that performs object detection"""
 
@@ -987,6 +1029,7 @@ def _eikonal_soft_sweeping_diff(
     device = cost.device
 
     T = torch.full((B, H, W), cfg.large_val, device=device, dtype=cost.dtype)
+    assert torch.isfinite(T).all(), f"large_val={cfg.large_val} overflows dtype {cost.dtype}"
     T = torch.where(src_mask, torch.zeros_like(T), T)
 
     h_val      = float(cfg.h)
@@ -1090,6 +1133,7 @@ def _eikonal_soft_sweeping_diff_init(
     T = T_init.to(device=device, dtype=cost.dtype)
     if T.shape != (B, H, W):
         raise ValueError(f"T_init shape {tuple(T.shape)} must match cost shape {(B, H, W)}")
+    assert torch.isfinite(T).all(), f"T_init contains non-finite values (large_val={cfg.large_val}, dtype={cost.dtype})"
 
     # enforce source boundary
     T = torch.where(src_mask, torch.zeros_like(T), T)
@@ -1273,13 +1317,30 @@ class SAMRoute(SAMRoad):
         self.route_cost_net             = bool(_cfg(config, "ROUTE_COST_NET", False))
         self.route_cost_net_ch          = int(_cfg(config,  "ROUTE_COST_NET_CH", 8))
         self.route_cost_net_use_coord   = bool(_cfg(config, "ROUTE_COST_NET_USE_COORD", False))
+        self.route_cost_net_use_grad    = bool(_cfg(config, "ROUTE_COST_NET_USE_GRAD", False))
         self.route_cost_net_delta_scale = float(_cfg(config, "ROUTE_COST_NET_DELTA_SCALE", 0.75))
+        self.route_cost_net_arch        = str(_cfg(config, "ROUTE_COST_NET_ARCH", "basic"))
+        self.route_cost_net_gate        = str(_cfg(config, "ROUTE_COST_NET_GATE", "none"))
+        self.lambda_cost_reg            = float(_cfg(config, "LAMBDA_COST_REG", 0.0))
+        self.lambda_cost_tv             = float(_cfg(config, "LAMBDA_COST_TV", 0.0))
 
         if self.route_cost_net:
-            in_ch = 1 + (2 if self.route_cost_net_use_coord else 0)
-            self.cost_net = ResidualCostNet(in_ch=in_ch, mid_ch=self.route_cost_net_ch)
+            in_ch = (1
+                     + (2 if self.route_cost_net_use_coord else 0)
+                     + (1 if self.route_cost_net_use_grad  else 0))
+            if self.route_cost_net_arch == "multiscale":
+                self.cost_net = ResidualCostNetMultiScaleLite(in_ch=in_ch, mid_ch=self.route_cost_net_ch)
+            else:
+                self.cost_net = ResidualCostNet(in_ch=in_ch, mid_ch=self.route_cost_net_ch)
+            if self.route_cost_net_gate == "sigmoid":
+                self.cost_net_gate_head = torch.nn.Conv2d(in_ch, 1, kernel_size=1, bias=True)
+                torch.nn.init.zeros_(self.cost_net_gate_head.weight)
+                torch.nn.init.constant_(self.cost_net_gate_head.bias, -2.0)
+            else:
+                self.cost_net_gate_head = None
         else:
             self.cost_net = None
+            self.cost_net_gate_head = None
 
         # Learnable Eikonal-Euclidean blending gate (residual form)
         _gate_init = float(_cfg(config, "ROUTE_EIK_GATE_INIT", 0.80))
@@ -1358,8 +1419,28 @@ class SAMRoute(SAMRoad):
         mask_scores = torch.sigmoid(mask_logits)
         return mask_logits.permute(0, 2, 3, 1), mask_scores.permute(0, 2, 3, 1)
 
+    @staticmethod
+    def _sobel_magnitude(x: torch.Tensor) -> torch.Tensor:
+        """Sobel gradient magnitude. x: [B,1,H,W] fp32 → [B,1,H,W] fp32.
+
+        Peaks at road probability boundaries (edges/broken connections) —
+        exactly the regions where cost correction is most needed.
+        Fixed kernels, no learnable parameters.
+        """
+        kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+                          device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+        ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
+                          device=x.device, dtype=x.dtype).view(1, 1, 3, 3)
+        gx = F.conv2d(x, kx, padding=1)
+        gy = F.conv2d(x, ky, padding=1)
+        return (gx ** 2 + gy ** 2 + 1e-8).sqrt()   # [B,1,H,W]
+
     def _cost_net_delta_log(self, road_prob: torch.Tensor) -> "torch.Tensor | None":
         """Compute tanh-bounded log-cost residual via ResidualCostNet.
+
+        Runs in fp32 (autocast disabled) to prevent gradient overflow under
+        AMP GradScaler — the Eikonal backward amplifies gradients through
+        deep iteration chains, and fp16 intermediates overflow at scale 65536.
 
         Args:
             road_prob: [B, H, W] probability map (already pooled to grid resolution).
@@ -1370,18 +1451,48 @@ class SAMRoute(SAMRoad):
         """
         if self.cost_net is None:
             return None
+        original_dim = road_prob.dim()
+        if original_dim == 4 and road_prob.shape[1] == 1:
+            road_prob = road_prob[:, 0]
         if road_prob.dim() == 2:
             road_prob = road_prob.unsqueeze(0)
-        x = road_prob.unsqueeze(1)  # [B,1,H,W]
+        x = road_prob.float().unsqueeze(1)  # [B,1,H,W] fp32
+        if self.route_cost_net_use_grad:
+            grad_mag = self._sobel_magnitude(x)   # [B,1,H,W]
+            x = torch.cat([x, grad_mag], dim=1)   # [B,2,H,W]
         if self.route_cost_net_use_coord:
             B, _, H, W = x.shape
             yy = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype)
             xx = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype)
             yy = yy.view(1, 1, H, 1).expand(B, -1, -1, W)
             xx = xx.view(1, 1, 1, W).expand(B, -1, H, -1)
-            x = torch.cat([x, yy, xx], dim=1)  # [B,3,H,W]
-        raw = self.cost_net(x)  # [B,1,H,W]
-        return (torch.tanh(raw) * self.route_cost_net_delta_scale).squeeze(1)  # [B,H,W]
+            x = torch.cat([x, yy, xx], dim=1)
+        with torch.amp.autocast("cuda", enabled=False):
+            raw = self.cost_net(x)  # [B,1,H,W] fp32
+            delta = torch.tanh(raw)
+            if self.cost_net_gate_head is not None:
+                gate = torch.sigmoid(self.cost_net_gate_head(x))
+                delta = gate * delta
+        delta = (delta * self.route_cost_net_delta_scale).squeeze(1)  # [B,H,W]
+        if original_dim == 2:
+            return delta[0]
+        if original_dim == 4:
+            return delta.unsqueeze(1)
+        return delta
+
+    @staticmethod
+    def _residual_reg(delta_log: torch.Tensor) -> torch.Tensor:
+        if delta_log.numel() == 0:
+            return delta_log.sum() * 0.0
+        return (delta_log ** 2).mean() + (delta_log.mean() ** 2)
+
+    @staticmethod
+    def _tv_l1(x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x.sum() * 0.0
+        dx = (x[..., 1:] - x[..., :-1]).abs().mean()
+        dy = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
+        return dx + dy
 
     def _road_prob_to_cost(self, road_prob: torch.Tensor) -> torch.Tensor:
         """
@@ -1434,8 +1545,14 @@ class SAMRoute(SAMRoad):
 
         delta_log = self._cost_net_delta_log(road_prob)
         if delta_log is not None:
-            base_cost = base_cost * torch.exp(delta_log)
+            if base_cost.dim() == 4 and base_cost.shape[1] == 1 and delta_log.dim() == 3:
+                delta_log = delta_log.unsqueeze(1)
+            elif base_cost.dim() == 3 and delta_log.dim() == 4 and delta_log.shape[1] == 1:
+                delta_log = delta_log[:, 0]
+            base_cost = base_cost.float() * torch.exp(delta_log.float())
 
+        if base_cost.dim() == 4 and base_cost.shape[1] == 1:
+            base_cost = base_cost[:, 0]
         return base_cost
 
     def _apply_dist_cap(
@@ -1976,6 +2093,18 @@ class SAMRoute(SAMRoad):
             dist_contrib = lam * loss_dist
             loss = loss + dist_contrib
 
+            # Optional residual-cost regularization for stability.
+            if self.cost_net is not None:
+                delta_reg = self._cost_net_delta_log(road_prob)
+                if delta_reg is not None and self.lambda_cost_reg > 0:
+                    reg = self.lambda_cost_reg * self._residual_reg(delta_reg)
+                    loss = loss + reg
+                    self.log("cost_reg", reg, on_step=True, on_epoch=False)
+                if delta_reg is not None and self.lambda_cost_tv > 0:
+                    tv = self.lambda_cost_tv * self._tv_l1(delta_reg)
+                    loss = loss + tv
+                    self.log("cost_tv", tv, on_step=True, on_epoch=False)
+
             self.log("train_dist_loss", loss_dist, on_step=True, on_epoch=False, prog_bar=True)
             self.log("dist_loss_weighted", dist_contrib, on_step=True, on_epoch=False, prog_bar=True)
             self.log("lambda_dist_eff", lam,       on_step=True, on_epoch=False)
@@ -2005,6 +2134,23 @@ class SAMRoute(SAMRoad):
                 self.log("gt_dist_mean",   valid_gt.mean(),   on_step=True, on_epoch=False)
                 self.log("dist_abs_err",   (valid_pred - valid_gt).abs().mean(),
                          on_step=True, on_epoch=False)
+                if self.cost_net is not None:
+                    delta_dbg = self._cost_net_delta_log(road_prob)
+                    if delta_dbg is not None:
+                        self.log("delta_abs_mean", delta_dbg.abs().mean(), on_step=True, on_epoch=False)
+                        self.log("delta_sparsity", (delta_dbg.abs() < 1e-3).float().mean(),
+                                 on_step=True, on_epoch=False)
+                        if self.cost_net_gate_head is not None:
+                            x_dbg = road_prob.unsqueeze(1)
+                            if self.route_cost_net_use_coord:
+                                B, _, H, W = x_dbg.shape
+                                yy = torch.linspace(-1, 1, H, device=x_dbg.device, dtype=x_dbg.dtype)
+                                xx = torch.linspace(-1, 1, W, device=x_dbg.device, dtype=x_dbg.dtype)
+                                yy = yy.view(1, 1, H, 1).expand(B, -1, -1, W)
+                                xx = xx.view(1, 1, 1, W).expand(B, -1, H, -1)
+                                x_dbg = torch.cat([x_dbg, yy, xx], dim=1)
+                            gate_dbg = torch.sigmoid(self.cost_net_gate_head(x_dbg))
+                            self.log("gate_mean", gate_dbg.mean(), on_step=True, on_epoch=False)
                 if loss_seg.item() > 0 and valid.any():
                     self.log("dist_seg_ratio", loss_dist.item() / loss_seg.item(),
                              on_step=True, on_epoch=False)
@@ -2161,6 +2307,15 @@ class SAMRoute(SAMRoad):
                 })
                 if cost_lr_scale != 1.0:
                     print(f"[SAMRoute] Cost params lr_scale={cost_lr_scale} -> lr={eik_lr:.2e}")
+            if self.cost_net is not None:
+                costnet_params = list(self.cost_net.parameters())
+                if self.cost_net_gate_head is not None:
+                    costnet_params += list(self.cost_net_gate_head.parameters())
+                if costnet_params:
+                    param_dicts.append({
+                        'params': costnet_params,
+                        'lr': self.config.BASE_LR,
+                    })
 
         for i, pd in enumerate(param_dicts):
             print(f'[SAMRoute] param group {i}: {sum(p.numel() for p in pd["params"])} params')

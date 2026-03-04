@@ -169,7 +169,8 @@ seg_dist_lora)
         --grad_clip              1.0 \
         --freeze_cost_params \
         --road_pos_weight        15 \
-        --road_dice_weight       0.5
+        --road_dice_weight       0.5 \
+        --road_thin_boost        4
     ;;
 
 # ------------------------------------------------------------------

@@ -120,7 +120,7 @@ class EikonalConfig:
     tau_min: float = 0.1
     tau_branch: float = 0.1
     tau_update: float = 0.01  # soft monotone 时更接近 hard min，误差更小
-    large_val: float = 1e6
+    large_val: float = 1e4
     eps: float = 1e-6
     use_redblack: bool = True
     monotone: bool = True
@@ -212,6 +212,7 @@ def eikonal_soft_sweeping(
     B, H, W = cost.shape
     device = cost.device
     T = torch.full((B, H, W), cfg.large_val, device=device, dtype=cost.dtype)
+    assert torch.isfinite(T).all(), f"large_val={cfg.large_val} overflows dtype {cost.dtype}"
 
     if source_yx is not None:
         assert B == 1, (
