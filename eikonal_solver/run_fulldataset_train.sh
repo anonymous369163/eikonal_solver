@@ -224,9 +224,102 @@ ablation_focal)
         --road_focal_gamma       2.0
     ;;
 
+# ------------------------------------------------------------------
+# 7) v4: same as v2, but with ResidualCostNet CNN enabled
+#    Pretrained: original SAM-Road checkpoint (same starting point as v2)
+#    cost_net: 3-layer CNN predicting bounded log-cost residual
+#    freeze_cost_params: still frozen (alpha/gamma/gate fixed, same as v2)
+#    cost_net is independently trainable (zero-init last layer => starts as identity)
+# ------------------------------------------------------------------
+seg_dist_lora_v4)
+    OUTPUT_DIR="training_outputs/fulldataset_seg_dist_lora_v4"
+    RUN_NAME="${RUN_NAME:-seg_dist_lora_v4}"
+    python finetune_demo_updated.py \
+        --data_root              "$DATA_ROOT" \
+        --pretrained_ckpt        "$PRETRAINED" \
+        --epochs                 20 \
+        --batch_size             16 \
+        --devices                "$NGPUS" \
+        --workers                "$WORKERS" \
+        --val_fraction           "$VAL_FRAC" \
+        --samples_per_region     "$SAMPLES" \
+        --road_dilation_radius   "$DILATION" \
+        --output_dir             "$OUTPUT_DIR" \
+        --run_name               "$RUN_NAME" \
+        --lr                     2e-4 \
+        --lr_scheduler           cosine \
+        --lr_warmup_epochs       3 \
+        --lr_min                 1e-6 \
+        --encoder_lora \
+        --lora_rank              4 \
+        --road_pos_weight        5.0 \
+        --road_dice_weight       0.8 \
+        --road_dual_target \
+        --road_thin_boost        10.0 \
+        --lambda_dist            0.05 \
+        --dist_supervision       gtmask_random \
+        --multigrid \
+        --eik_iters              40 \
+        --eik_downsample         16 \
+        --mg_factor              4 \
+        --grad_clip              1.0 \
+        --freeze_cost_params \
+        --cost_net \
+        --cost_net_ch            8 \
+        --cost_net_delta_scale   0.75 \
+        --lambda_cost_reg        0.01 \
+        --lambda_cost_tv         0.005
+    ;;
+
+# ------------------------------------------------------------------
+# 8) v5: same as v4, but with U-Net-like multiscale ResidualCostNet
+#    cost_net_arch=multiscale: 2-stage down/up FPN (20360 params vs basic 672)
+#    Captures multi-scale spatial cost patterns (road width, intersections)
+# ------------------------------------------------------------------
+seg_dist_lora_v5)
+    OUTPUT_DIR="training_outputs/fulldataset_seg_dist_lora_v5"
+    RUN_NAME="${RUN_NAME:-seg_dist_lora_v5}"
+    python finetune_demo_updated.py \
+        --data_root              "$DATA_ROOT" \
+        --pretrained_ckpt        "$PRETRAINED" \
+        --epochs                 20 \
+        --batch_size             16 \
+        --devices                "$NGPUS" \
+        --workers                "$WORKERS" \
+        --val_fraction           "$VAL_FRAC" \
+        --samples_per_region     "$SAMPLES" \
+        --road_dilation_radius   "$DILATION" \
+        --output_dir             "$OUTPUT_DIR" \
+        --run_name               "$RUN_NAME" \
+        --lr                     2e-4 \
+        --lr_scheduler           cosine \
+        --lr_warmup_epochs       3 \
+        --lr_min                 1e-6 \
+        --encoder_lora \
+        --lora_rank              4 \
+        --road_pos_weight        5.0 \
+        --road_dice_weight       0.8 \
+        --road_dual_target \
+        --road_thin_boost        10.0 \
+        --lambda_dist            0.05 \
+        --dist_supervision       gtmask_random \
+        --multigrid \
+        --eik_iters              40 \
+        --eik_downsample         16 \
+        --mg_factor              4 \
+        --grad_clip              1.0 \
+        --freeze_cost_params \
+        --cost_net \
+        --cost_net_ch            8 \
+        --cost_net_arch          multiscale \
+        --cost_net_delta_scale   0.75 \
+        --lambda_cost_reg        0.01 \
+        --lambda_cost_tv         0.005
+    ;;
+
 *)
     echo "Unknown mode: $MODE"
-    echo "Usage: $0 {seg_only|seg_dist_npz|seg_dist_gtmask|seg_lora|seg_dist_lora|ablation_focal} [run_name]"
+    echo "Usage: $0 {seg_only|seg_dist_npz|seg_dist_gtmask|seg_lora|seg_dist_lora|seg_dist_lora_v4|seg_dist_lora_v5|ablation_focal} [run_name]"
     exit 1
     ;;
 esac

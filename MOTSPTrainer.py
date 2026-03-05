@@ -1,6 +1,9 @@
 import torch
+import torch.nn as nn
 from logging import getLogger
+from collections import OrderedDict
 import time
+import math
 
 from MOTSPEnv import TSPEnv as Env
 from MOTSPModel import TSPModel as Model
@@ -13,6 +16,7 @@ from utils.utils import *
 
 import numpy as np
 import os
+import sys
 
 
 class TSPTrainer:
@@ -66,7 +70,74 @@ class TSPTrainer:
         self.model = Model(**self.model_params)
         
         self.env = Env(**self.env_params)
-        self.optimizer = Optimizer(self.model.parameters(), **self.optimizer_params['optimizer'])
+
+        # --- End-to-End Eikonal: load SAMRoute and build joint optimizer ---
+        self.encoder_mode = self.model_params.get('encoder_mode', 'graph_image_fusion')
+        self.samroute_model = None
+        self._road_prob_cache = OrderedDict()
+        self._road_prob_cache_size = 10
+        self._disk_cache_logged = False
+        self._tif_path_map = {}
+        self.e2e_grad_clip_norm = float(self.model_params.get('e2e_grad_clip_norm', 1.0))
+        self._e2e_step_count = 0
+        self._e2e_parallel = bool(self.model_params.get('e2e_parallel_cases', True))
+        self._e2e_use_compile = bool(self.model_params.get('e2e_use_compile', False))
+        self._e2e_grad_interval = int(self.model_params.get('e2e_grad_interval', 1))
+        self._e2e_train_decoder = bool(self.model_params.get('e2e_train_decoder', False))
+        self._e2e_decoder_lr = float(self.model_params.get('e2e_decoder_lr', 1e-4))
+        self._encoder_cache_available = False
+        self._encoder_feat_cache = OrderedDict()
+        self._encoder_feat_cache_size = 20
+
+        if self.encoder_mode == 'e2e_eikonal':
+            self._build_tif_path_map()
+            has_encoder_cache = self._check_encoder_cache_coverage()
+            has_disk_cache = self._check_disk_cache_coverage()
+
+            if self._e2e_train_decoder and has_encoder_cache:
+                self._encoder_cache_available = True
+                self.logger.info("[E2E] Encoder embedding cache found — "
+                                 "decoder will be trainable (~177K params)")
+                self.samroute_model = self._load_samroute(
+                    device, skip_encoder=True, keep_decoder=True)
+            elif has_disk_cache:
+                self.logger.info("[E2E] Disk road_prob cache found for all datasets — "
+                                 "loading SAMRoute without image_encoder.")
+                self.samroute_model = self._load_samroute(device, skip_encoder=True)
+            else:
+                self.samroute_model = self._load_samroute(device, skip_encoder=False)
+
+            samroute_cost_params = []
+            samroute_decoder_params = []
+            for name, p in self.samroute_model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if name.startswith('map_decoder'):
+                    samroute_decoder_params.append(p)
+                else:
+                    samroute_cost_params.append(p)
+
+            samroute_lr = float(self.model_params.get('e2e_samroute_lr', 1e-3))
+            opt_groups = [
+                {'params': self.model.parameters()},
+                {'params': samroute_cost_params, 'lr': samroute_lr},
+            ]
+            if samroute_decoder_params:
+                opt_groups.append({'params': samroute_decoder_params, 'lr': self._e2e_decoder_lr})
+            self.optimizer = Optimizer(opt_groups, **self.optimizer_params['optimizer'])
+
+            n_cost = sum(p.numel() for p in samroute_cost_params)
+            n_dec = sum(p.numel() for p in samroute_decoder_params)
+            self.logger.info(f"[E2E] SAMRoute trainable: cost_params={n_cost}, "
+                             f"decoder_params={n_dec}, total={n_cost + n_dec}")
+            self.logger.info(f"[E2E] SAMRoute cost_lr={samroute_lr}, decoder_lr={self._e2e_decoder_lr}, "
+                             f"grad_clip_norm={self.e2e_grad_clip_norm}")
+            self.logger.info(f"[E2E] parallel_cases={self._e2e_parallel}, use_compile={self._e2e_use_compile}")
+            self.logger.info(f"[E2E] grad_interval={self._e2e_grad_interval}, "
+                             f"train_decoder={self._e2e_train_decoder}")
+        else:
+            self.optimizer = Optimizer(self.model.parameters(), **self.optimizer_params['optimizer'])
+
         self.scheduler = Scheduler(self.optimizer, **self.optimizer_params['scheduler'])
 
         # Restore
@@ -76,18 +147,34 @@ class TSPTrainer:
             checkpoint_fullname = '{path}/checkpoint_motsp-{epoch}.pt'.format(**model_load)
             checkpoint = torch.load(checkpoint_fullname, map_location=device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.start_epoch = 1 + model_load['epoch']
-            self.result_log.set_raw_data(checkpoint['result_log'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.last_epoch = model_load['epoch']-1
-            self.logger.info('Saved Model Loaded !!')
+
+            warmstart_only = model_load.get('warmstart_only', False)
+            if warmstart_only:
+                self.start_epoch = 1
+                self.logger.info('Warmstart: loaded model weights only, optimizer/scheduler reset.')
+            else:
+                self.start_epoch = 1 + model_load['epoch']
+                self.result_log.set_raw_data(checkpoint['result_log'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.scheduler.last_epoch = model_load['epoch'] - 1
+                self.logger.info('Saved Model Loaded !!')
 
         # utility
         self.time_estimator = TimeEstimator()
         
         # TensorBoard writer
         self.tb_writer = SummaryWriter(log_dir=os.path.join(self.result_folder, 'tensorboard'))
-        
+        # Log encoder_mode for run identification (e2e vs graph_only etc.)
+        _tb_mode = self.encoder_mode
+        if self.encoder_mode == 'e2e_eikonal' and self._e2e_train_decoder:
+            _tb_mode = 'e2e_decoder'
+        self.tb_writer.add_text('config/encoder_mode', _tb_mode, 0)
+        self.tb_writer.add_hparams(
+            {'encoder_mode': _tb_mode},
+            {'config/placeholder': 0.0},
+            run_name=None
+        )
+
         # Validation configuration
         self.validation_interval = trainer_params.get('validation_interval', 10)  # Validate every N epochs
         self.validation_batch_size = trainer_params.get('validation_batch_size', 64)
@@ -125,6 +212,324 @@ class TSPTrainer:
             except Exception as e:
                 self.logger.warning(f'Failed to initialize ValidationDatasetLoader: {e}')
                 self.val_loader = None
+
+        if self.encoder_mode == 'e2e_eikonal' and validation_datasets:
+            for ds in (validation_datasets or []):
+                name = ds.get('name', '')
+                tif_path = ds.get('satellite_tif_path', None)
+                if name and tif_path:
+                    self._tif_path_map[f"val_{name}"] = tif_path
+                    if name not in self._tif_path_map:
+                        self._tif_path_map[name] = tif_path
+
+    # ------------------------------------------------------------------
+    #  End-to-End Eikonal helpers
+    # ------------------------------------------------------------------
+
+    def _build_tif_path_map(self):
+        """Build dataset_name -> satellite_tif_path map from train loaders."""
+        if self.dataset_loader is not None:
+            for info in self.dataset_loader.get_dataset_info():
+                name = info.get('name', '')
+                tif_path = info.get('satellite_tif_path', None)
+                if name and tif_path:
+                    self._tif_path_map[name] = tif_path
+                    self._tif_path_map[f"val_{name}"] = tif_path
+
+    def _check_disk_cache_coverage(self):
+        """Check whether all datasets have pre-computed road_prob_cache.npz."""
+        if not self._tif_path_map:
+            return False
+        for name, tif_path in self._tif_path_map.items():
+            cache_path = os.path.join(os.path.dirname(tif_path), 'road_prob_cache.npz')
+            if not os.path.exists(cache_path):
+                return False
+        return True
+
+    def _check_encoder_cache_coverage(self):
+        """Check whether all datasets have pre-computed encoder_cache.pt."""
+        if not self._tif_path_map:
+            return False
+        for name, tif_path in self._tif_path_map.items():
+            cache_path = os.path.join(os.path.dirname(tif_path), 'encoder_cache.pt')
+            if not os.path.exists(cache_path):
+                return False
+        return True
+
+    def _load_samroute(self, device, skip_encoder=False, keep_decoder=False):
+        """Load SAMRoute checkpoint, freeze encoder, enable grad only for cost params.
+
+        Args:
+            skip_encoder: offload image_encoder (and optionally map_decoder) to CPU.
+            keep_decoder: when True (and skip_encoder=True), keep map_decoder on GPU
+                          so it can participate in gradient updates.
+        """
+        eikonal_dir = os.path.join(os.path.dirname(__file__), 'eikonal_solver')
+        if eikonal_dir not in sys.path:
+            sys.path.insert(0, eikonal_dir)
+        from model_multigrid import SAMRoute
+
+        ckpt_path = self.model_params['e2e_eikonal_ckpt']
+        if not os.path.isabs(ckpt_path):
+            ckpt_path = os.path.join(os.path.dirname(__file__), ckpt_path)
+
+        raw = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        sd = raw.get('state_dict', raw)
+        sd = {(k[len('model.'):] if k.startswith('model.') else k): v for k, v in sd.items()}
+
+        pe = sd.get('image_encoder.pos_embed')
+        patch_size = int(pe.shape[1]) * 16 if pe is not None else 512
+
+        w7 = sd.get('map_decoder.7.weight')
+        use_smooth = w7 is not None and w7.shape[1] == 32
+
+        from types import SimpleNamespace
+        cfg = SimpleNamespace(
+            SAM_VERSION='vit_b',
+            PATCH_SIZE=patch_size,
+            NO_SAM=False,
+            USE_SAM_DECODER=False,
+            USE_SMOOTH_DECODER=use_smooth,
+            ENCODER_LORA=False,
+            LORA_RANK=4,
+            FREEZE_ENCODER=True,
+            FOCAL_LOSS=False,
+            TOPONET_VERSION='default',
+            SAM_CKPT_PATH=os.path.join(
+                os.path.dirname(__file__), 'sam_road_repo', 'sam_ckpts', 'sam_vit_b_01ec64.pth'),
+            ROUTE_COST_MODE='add',
+            ROUTE_ADD_ALPHA=20.0,
+            ROUTE_ADD_GAMMA=2.0,
+            ROUTE_ADD_BLOCK_ALPHA=0.0,
+            ROUTE_BLOCK_TH=0.0,
+            ROUTE_ROI_MARGIN=64,
+            ROUTE_COST_NET=bool(self.model_params.get('e2e_eikonal_train_cost_net', False)),
+            ROUTE_COST_NET_CH=8,
+            ROUTE_COST_NET_USE_COORD=False,
+        )
+
+        model = SAMRoute(cfg)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing:
+            self.logger.warning(f"[SAMRoute] missing keys: {missing}")
+        if unexpected:
+            self.logger.warning(f"[SAMRoute] unexpected keys: {unexpected}")
+
+        model.requires_grad_(False)
+
+        trainable_names = ['cost_log_alpha', 'cost_log_gamma', 'eik_gate_logit']
+        if cfg.ROUTE_COST_NET:
+            trainable_names.append('cost_net')
+        if self._e2e_train_decoder and keep_decoder:
+            trainable_names.append('map_decoder')
+        for name, param in model.named_parameters():
+            if any(name.startswith(tn) or name == tn for tn in trainable_names):
+                param.requires_grad_(True)
+                self.logger.info(f"[SAMRoute] trainable: {name}  shape={param.shape}")
+
+        model.to(device)
+        model.eval()
+
+        if skip_encoder and hasattr(model, 'image_encoder'):
+            model.image_encoder.cpu()
+            if hasattr(model, 'map_decoder') and not keep_decoder:
+                model.map_decoder.cpu()
+            torch.cuda.empty_cache()
+            if keep_decoder:
+                self.logger.info("[SAMRoute] Offloaded image_encoder to CPU, "
+                                 "map_decoder kept on GPU (trainable decoder mode)")
+            else:
+                self.logger.info("[SAMRoute] Offloaded image_encoder + map_decoder to CPU "
+                                 "(disk road_prob cache available)")
+
+        return model
+
+    def _compute_road_prob_cached(self, sat_img, cache_key, device):
+        """
+        Get road_prob, prioritizing: memory LRU cache > disk cache > online inference.
+
+        Args:
+            sat_img: [1, 3, H, W] uint8 tensor (CPU) from dataset loader.
+            cache_key: string key for LRU cache (e.g. dataset_name).
+            device: torch device.
+
+        Returns:
+            road_prob: [1, H, W] float32 tensor on device, detached.
+        """
+        if cache_key in self._road_prob_cache:
+            self._road_prob_cache.move_to_end(cache_key)
+            return self._road_prob_cache[cache_key]
+
+        # Try disk cache (road_prob_cache.npz in same dir as the TIF)
+        tif_path = self._tif_path_map.get(cache_key, None)
+        if tif_path is not None:
+            disk_cache = os.path.join(os.path.dirname(tif_path), 'road_prob_cache.npz')
+            if os.path.exists(disk_cache):
+                rp_data = np.load(disk_cache, allow_pickle=True)
+                road_prob_np = rp_data['road_prob'].astype(np.float32)
+                if not self._disk_cache_logged:
+                    ckpt_name = str(rp_data['ckpt_name']) if 'ckpt_name' in rp_data else 'unknown'
+                    ts = str(rp_data['timestamp']) if 'timestamp' in rp_data else 'unknown'
+                    self.logger.info(f"[E2E] Disk road_prob cache: model={ckpt_name}, created={ts}")
+                    self._disk_cache_logged = True
+                road_prob = torch.from_numpy(road_prob_np).to(
+                    device, torch.float32,
+                ).unsqueeze(0).clamp(1e-6, 1.0 - 1e-6)
+                self._road_prob_cache[cache_key] = road_prob
+                if len(self._road_prob_cache) > self._road_prob_cache_size:
+                    self._road_prob_cache.popitem(last=False)
+                return road_prob
+
+        # Fallback: online inference
+        eikonal_dir = os.path.join(os.path.dirname(__file__), 'eikonal_solver')
+        if eikonal_dir not in sys.path:
+            sys.path.insert(0, eikonal_dir)
+        from gradcheck_route_loss_v2_multigrid_fullmap import sliding_window_inference as swi
+
+        img_np = sat_img.squeeze(0).permute(1, 2, 0).numpy()
+        patch_size = getattr(self.samroute_model, 'patch_size', 512)
+
+        with torch.no_grad():
+            road_prob_np = swi(
+                img_np, self.samroute_model, device,
+                patch_size=patch_size, verbose=False,
+            ).astype(np.float32)
+
+        road_prob = torch.from_numpy(road_prob_np).to(
+            device, torch.float32,
+        ).unsqueeze(0).clamp(1e-6, 1.0 - 1e-6)
+
+        self._road_prob_cache[cache_key] = road_prob
+        if len(self._road_prob_cache) > self._road_prob_cache_size:
+            self._road_prob_cache.popitem(last=False)
+
+        return road_prob
+
+    def _load_encoder_features(self, cache_key, device):
+        """Load encoder features from LRU memory cache or disk encoder_cache.pt.
+
+        Returns:
+            (patches_info, features, win2d, H, W) or None if no cache found.
+            features: [N, 256, 32, 32] float32 tensor on CPU (stacked).
+        """
+        if cache_key in self._encoder_feat_cache:
+            self._encoder_feat_cache.move_to_end(cache_key)
+            return self._encoder_feat_cache[cache_key]
+
+        tif_path = self._tif_path_map.get(cache_key, None)
+        if tif_path is None:
+            return None
+
+        cache_path = os.path.join(os.path.dirname(tif_path), 'encoder_cache.pt')
+        if not os.path.exists(cache_path):
+            return None
+
+        data = torch.load(cache_path, map_location='cpu', weights_only=False)
+        if not self._disk_cache_logged:
+            ckpt_name = data.get('ckpt_name', 'unknown')
+            ts = data.get('timestamp', 'unknown')
+            self.logger.info(f"[E2E] Encoder cache: model={ckpt_name}, created={ts}")
+            self._disk_cache_logged = True
+
+        features = data['features'].float()  # [N, 256, 32, 32]
+        patches_info = data['patches_info']
+        win2d = data['win2d']
+        H, W = data['H'], data['W']
+
+        entry = (patches_info, features, win2d, H, W)
+        self._encoder_feat_cache[cache_key] = entry
+        if len(self._encoder_feat_cache) > self._encoder_feat_cache_size:
+            self._encoder_feat_cache.popitem(last=False)
+
+        return entry
+
+    _DECODER_CHUNK_SIZE = 32
+
+    def _compute_road_prob_differentiable(self, cache_key, device):
+        """Compute road_prob with gradients flowing through map_decoder.
+
+        Uses chunked batch forward through map_decoder for efficiency:
+        one CPU→GPU transfer of the full feature tensor, then N/chunk_size
+        decoder calls instead of N individual calls.
+
+        Returns:
+            road_prob: [1, H, W] float32 tensor on device, with grad through decoder.
+        """
+        entry = self._load_encoder_features(cache_key, device)
+        if entry is None:
+            raise RuntimeError(
+                f"Encoder cache not found for '{cache_key}'. "
+                f"Run precompute_encoder_cache.py first.")
+
+        patches_info, features, win2d, H, W = entry
+
+        all_feat = features.to(device)  # [N, 256, 32, 32] single transfer
+        chunk = self._DECODER_CHUNK_SIZE
+        all_probs = []
+        for i in range(0, all_feat.shape[0], chunk):
+            logits = self.samroute_model.map_decoder(all_feat[i:i + chunk])
+            all_probs.append(torch.sigmoid(logits[:, 1, :, :]))
+        all_probs = torch.cat(all_probs, dim=0)  # [N, patch_H, patch_W]
+
+        win_t = torch.from_numpy(win2d).to(device)
+        prob_sum = torch.zeros(H, W, device=device)
+        weight_sum = torch.zeros(H, W, device=device)
+
+        for idx, (y0, x0, ph, pw) in enumerate(patches_info):
+            prob_sum[y0:y0 + ph, x0:x0 + pw] += (
+                all_probs[idx, :ph, :pw] * win_t[:ph, :pw])
+            weight_sum[y0:y0 + ph, x0:x0 + pw] += win_t[:ph, :pw]
+
+        road_prob = (prob_sum / weight_sum.clamp(min=1e-6)).unsqueeze(0)
+        return road_prob.clamp(1e-6, 1.0 - 1e-6)
+
+    def _compute_distance_matrix_e2e(self, road_prob, node_coords_norm, device):
+        """
+        Compute differentiable distance matrix via SAMRoute Eikonal solver.
+
+        Uses ``forward_distance_matrix_batch`` which precomputes cost maps once
+        for all cases in the batch (avoiding redundant ``_road_prob_to_cost``).
+
+        Args:
+            road_prob: [1, H, W] detached road probability tensor on device.
+            node_coords_norm: [B, N, 2] normalized (x, y) bottom-left coords.
+            device: torch device.
+
+        Returns:
+            distance_matrix: [B, N, N] with grad through cost_log_alpha/gamma.
+        """
+        B, N, _ = node_coords_norm.shape
+        _, H, W = road_prob.shape
+
+        ds = int(self.model_params.get('e2e_eikonal_ds', 16))
+        eik_iters = int(self.model_params.get('e2e_eikonal_eik_iters', 40))
+        pool_mode = self.model_params.get('e2e_eikonal_pool_mode', 'max')
+        iter_floor_c = float(self.model_params.get('e2e_eikonal_iter_floor_c', 1.2))
+        iter_floor_f = float(self.model_params.get('e2e_eikonal_iter_floor_f', 0.65))
+
+        batch_nodes_yx = []
+        for b in range(B):
+            x_norm = node_coords_norm[b, :, 0]
+            y_norm = node_coords_norm[b, :, 1]
+            y_pix = torch.round((1.0 - y_norm) * (H - 1)).long()
+            x_pix = torch.round(x_norm * (W - 1)).long()
+            batch_nodes_yx.append(torch.stack([y_pix, x_pix], dim=-1))
+
+        with torch.amp.autocast("cuda", enabled=False):
+            D_batch = self.samroute_model.forward_distance_matrix_batch(
+                batch_nodes_yx,
+                road_prob=road_prob.float(),
+                ds=ds,
+                eik_iters=eik_iters,
+                pool_mode=pool_mode,
+                iter_floor_c=iter_floor_c,
+                iter_floor_f=iter_floor_f,
+                parallel_cases=self._e2e_parallel,
+                use_compile=self._e2e_use_compile,
+            )
+
+        distance_matrix = D_batch.float() / float(H)
+        return distance_matrix
 
     def run(self):
         self.time_estimator.reset(self.start_epoch)
@@ -185,7 +590,6 @@ class TSPTrainer:
                         self.best_epoch = epoch
                         self.patience_counter = 0
                         
-                        # Save best model
                         best_checkpoint_dict = {
                             'epoch': epoch,
                             'model_state_dict': self.model.state_dict(),
@@ -194,6 +598,8 @@ class TSPTrainer:
                             'result_log': self.result_log.get_raw_data(),
                             'best_val_gap': self.best_val_gap,
                         }
+                        if self.samroute_model is not None:
+                            best_checkpoint_dict['samroute_state_dict'] = self.samroute_model.state_dict()
                         torch.save(best_checkpoint_dict, '{}/checkpoint_motsp_best.pt'.format(self.result_folder))
                         self.logger.info(f'  *** New best model saved! Gap: {avg_gap:.2f}% (epoch {epoch}) ***')
                         self.tb_writer.add_scalar('Validation/Best_Gap_Percent', avg_gap, epoch)
@@ -228,6 +634,8 @@ class TSPTrainer:
                     'scheduler_state_dict': self.scheduler.state_dict(),
                     'result_log': self.result_log.get_raw_data()
                 }
+                if self.samroute_model is not None:
+                    checkpoint_dict['samroute_state_dict'] = self.samroute_model.state_dict()
                 torch.save(checkpoint_dict, '{}/checkpoint_motsp-{}.pt'.format(self.result_folder, epoch))
 
             if all_done:
@@ -283,18 +691,47 @@ class TSPTrainer:
 
         # Prep
         ###############################################
+        step_t0 = time.time()
         self.model.train()
         device = next(self.model.parameters()).device
 
+        is_full_grad_step = True
+        if self.encoder_mode == 'e2e_eikonal' and self._e2e_grad_interval > 1:
+            is_full_grad_step = (self._e2e_step_count % self._e2e_grad_interval == 0)
+
         if self.dataset_loader is not None:
-            # Use the dataset loader
             problems, dist_matrix, sat_img, dataset_name = self.dataset_loader.sample_batch(batch_size)
             problems = problems.to(device)
             dist_matrix = dist_matrix.to(device)
-            # sat_img: (1, 3, H, W), uint8 on CPU - keep on CPU for SAM-Road patch-wise inference
-            self.env.load_problems(batch_size, problems=problems, distance_matrix=dist_matrix, sat_images=sat_img)
+
+            if self.encoder_mode == 'e2e_eikonal':
+                if sat_img is None:
+                    raise RuntimeError("e2e_eikonal requires satellite images but got None")
+
+                if self._encoder_cache_available:
+                    if is_full_grad_step:
+                        road_prob = self._compute_road_prob_differentiable(
+                            dataset_name, device)
+                    else:
+                        with torch.no_grad():
+                            road_prob = self._compute_road_prob_differentiable(
+                                dataset_name, device)
+                else:
+                    road_prob = self._compute_road_prob_cached(
+                        sat_img, dataset_name, device)
+
+                node_coords_xy = problems
+                if is_full_grad_step:
+                    dist_matrix_e2e = self._compute_distance_matrix_e2e(road_prob, node_coords_xy, device)
+                else:
+                    with torch.no_grad():
+                        dist_matrix_e2e = self._compute_distance_matrix_e2e(road_prob, node_coords_xy, device)
+                self.env.load_problems(batch_size, problems=problems,
+                                       distance_matrix=dist_matrix_e2e, sat_images=None)
+            else:
+                self.env.load_problems(batch_size, problems=problems,
+                                       distance_matrix=dist_matrix, sat_images=sat_img)
         else:
-            # No custom dataset, generate random problems
             self.env.load_problems(batch_size)
 
         pref = torch.tensor([1.0, 0.0], device=device).float()
@@ -352,13 +789,60 @@ class TSPTrainer:
         score_mean_obj1 = -max_reward_obj1.float().mean()
         score_mean_obj2 = score_mean_obj1
     
-        #Step & Return
+        # Step & Return
         ################################################
         self.model.zero_grad()
+        if self.samroute_model is not None:
+            if is_full_grad_step:
+                self.samroute_model.zero_grad()
+            else:
+                for p in self.samroute_model.parameters():
+                    p.grad = None
+
         loss_mean.backward()
+
+        if self.encoder_mode == 'e2e_eikonal':
+            if is_full_grad_step:
+                nn.utils.clip_grad_norm_(
+                    list(self.model.parameters()) +
+                    [p for p in self.samroute_model.parameters() if p.requires_grad],
+                    max_norm=self.e2e_grad_clip_norm,
+                )
+            else:
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.e2e_grad_clip_norm)
+
+            self._e2e_step_count += 1
+            if self._e2e_step_count % 20 == 1:
+                if is_full_grad_step:
+                    self._log_samroute_grads()
+                else:
+                    self.logger.info("  [SAMRoute] fast step — SAMRoute grads skipped")
+
         self.optimizer.step()
-        
+
+        step_time = time.time() - step_t0
+        if self.encoder_mode == 'e2e_eikonal':
+            tag = 'full' if is_full_grad_step else 'fast'
+            self.tb_writer.add_scalar(f'e2e/step_wall_time_{tag}_sec', step_time, self._e2e_step_count)
+            self.tb_writer.add_scalar('e2e/step_wall_time_sec', step_time, self._e2e_step_count)
+
         return score_mean_obj1.item(), score_mean_obj2.item(), loss_mean.item()
+
+    def _log_samroute_grads(self):
+        """Log SAMRoute trainable parameter values and gradient norms."""
+        for name, p in self.samroute_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            grad_norm = p.grad.abs().mean().item() if p.grad is not None else 0.0
+            val = p.item() if p.numel() == 1 else p.data.norm().item()
+            self.logger.info(f"  [SAMRoute] {name}: value={val:.6f}, grad_norm={grad_norm:.8f}")
+            self.tb_writer.add_scalar(f'e2e/grad_{name}', grad_norm, self._e2e_step_count)
+            self.tb_writer.add_scalar(f'e2e/value_{name}', val, self._e2e_step_count)
+            if p.grad is not None:
+                assert grad_norm > 0, (
+                    f"[E2E] {name}.grad is zero! Gradient flow is broken. "
+                    f"Check that distance_matrix is not detached."
+                )
 
     def _validate_with_optimal(self):
         """
@@ -379,53 +863,54 @@ class TSPTrainer:
                 model_distances = []
                 optimal_distances = []
                 
-                # Process all samples in batches
                 for start_idx in range(0, num_samples, batch_size):
                     end_idx = min(start_idx + batch_size, num_samples)
                     batch_indices = np.arange(start_idx, end_idx)
                     actual_batch_size = len(batch_indices)
                     
-                    # Get validation batch
                     problems, dist_matrix, opt_dist, sat_img = \
                         self.val_loader.get_validation_batch(dataset_name, batch_indices)
                     
-                    # Move to device
                     problems = problems.to(device)
-                    dist_matrix = dist_matrix.to(device)
+
+                    if self.encoder_mode == 'e2e_eikonal' and sat_img is not None:
+                        val_key = f"val_{dataset_name}"
+                        if (self._encoder_cache_available
+                                and self._load_encoder_features(val_key, device) is not None):
+                            road_prob = self._compute_road_prob_differentiable(
+                                val_key, device)
+                        else:
+                            road_prob = self._compute_road_prob_cached(
+                                sat_img, val_key, device)
+                        dist_matrix = self._compute_distance_matrix_e2e(
+                            road_prob, problems, device)
+                    else:
+                        dist_matrix = dist_matrix.to(device)
                     
-                    # Load problems into environment
                     self.env.load_problems(
                         actual_batch_size, 
                         problems=problems, 
                         distance_matrix=dist_matrix,
-                        sat_images=sat_img
+                        sat_images=sat_img if self.encoder_mode != 'e2e_eikonal' else None,
                     )
                     
-                    # Generate preference vector (single objective)
                     pref = torch.tensor([1.0, 0.0], device=device).float()
-                    
-                    # Reset environment
                     reset_state, _, _ = self.env.reset()
                     
-                    # Model forward
                     self.model.decoder.assign(pref)
                     self.model.pre_forward(reset_state)
                     
-                    # POMO Rollout (greedy)
                     state, reward, done = self.env.pre_step()
                     while not done:
                         selected, _ = self.model(state)
                         state, reward, done = self.env.step(selected)
                     
-                    # reward shape: (batch, pomo, 1) - negative distance
-                    # Get the best among POMO
-                    tour_distances = -reward[:, :, 0]  # (batch, pomo)
-                    best_distances = tour_distances.min(dim=1).values  # (batch,)
+                    tour_distances = -reward[:, :, 0]
+                    best_distances = tour_distances.min(dim=1).values
                     
                     model_distances.extend(best_distances.cpu().numpy().tolist())
                     optimal_distances.extend(opt_dist.tolist())
                 
-                # Calculate gap: (model - optimal) / optimal * 100%
                 model_distances = np.array(model_distances)
                 optimal_distances = np.array(optimal_distances)
                 

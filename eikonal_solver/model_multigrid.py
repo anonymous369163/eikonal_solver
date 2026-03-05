@@ -981,7 +981,7 @@ def _get_compiled_eikonal_iter_chunk():
         return _eikonal_iter_chunk_compiled
     try:
         _eikonal_iter_chunk_compiled = torch.compile(
-            _eikonal_iter_chunk, mode="reduce-overhead", fullgraph=False,
+            _eikonal_iter_chunk, mode="default", fullgraph=False,
         )
         return _eikonal_iter_chunk_compiled
     except Exception:
@@ -1916,6 +1916,225 @@ class SAMRoute(SAMRoad):
         D = D - D.diag().diag()
         return D
 
+    def forward_distance_matrix_batch(
+        self,
+        batch_nodes_yx: "list[torch.Tensor]",
+        *,
+        road_prob: torch.Tensor,
+        ds: int = 16,
+        mg_factor: int = 4,
+        eik_iters: int = 40,
+        pool_mode: str = "max",
+        iter_floor_c: float = 1.2,
+        iter_floor_f: float = 0.65,
+        parallel_cases: bool = False,
+        disable_checkpoint: bool = False,
+        use_compile: bool = False,
+    ) -> torch.Tensor:
+        """Batch-optimised distance matrix: precompute cost maps once for all cases.
+
+        Same semantics as calling ``forward_distance_matrix`` B times with the
+        same ``road_prob``, but avoids redundant ``_road_prob_to_cost`` and
+        pooling work.
+
+        Args:
+            batch_nodes_yx: list of B tensors, each [N, 2] int64 pixel coords.
+            road_prob:      [1, H, W] float tensor in (0, 1).
+            ds, mg_factor, eik_iters, pool_mode, iter_floor_c, iter_floor_f:
+                same as ``forward_distance_matrix``.
+            parallel_cases: if True, merge all B*N source points into one Eikonal
+                call instead of looping over B cases sequentially.
+            disable_checkpoint: if True, disable gradient checkpointing (faster
+                backward at the cost of more GPU memory).
+
+        Returns:
+            D_batch: [B, N, N] distance matrix (pixel-unit road distances).
+        """
+        from dataclasses import replace as _dc_replace
+
+        road_prob = road_prob.clamp(1e-6, 1.0 - 1e-6)
+        device = road_prob.device
+        H, W = road_prob.shape[-2], road_prob.shape[-1]
+
+        def _pool(prob: torch.Tensor, factor: int) -> torch.Tensor:
+            if factor <= 1:
+                return prob
+            x = prob.unsqueeze(1)
+            ph = (factor - prob.shape[-2] % factor) % factor
+            pw = (factor - prob.shape[-1] % factor) % factor
+            if ph or pw:
+                x = F.pad(x, (0, pw, 0, ph), value=0.0)
+            if pool_mode == "avg":
+                return F.avg_pool2d(x, kernel_size=factor, stride=factor).squeeze(1)
+            return F.max_pool2d(x, kernel_size=factor, stride=factor).squeeze(1)
+
+        # --- precompute cost maps ONCE (differentiable via cost_log_alpha/gamma) ---
+        prob_f = _pool(road_prob, ds)
+        cost_f = self._road_prob_to_cost(prob_f).to(torch.float32)
+
+        ds_coarse = ds * mg_factor
+        prob_c = _pool(road_prob, ds_coarse)
+        cost_c = self._road_prob_to_cost(prob_c).to(torch.float32)
+
+        Hf, Wf = cost_f.shape[-2], cost_f.shape[-1]
+        Hc, Wc = cost_c.shape[-2], cost_c.shape[-1]
+
+        cfg = self.route_eik_cfg
+        large_val = float(cfg.large_val)
+        ckpt_chunk = int(self.route_ckpt_chunk)
+        gate_alpha = float(self.route_gate_alpha)
+
+        mg_itc = max(20, int(eik_iters * 0.25))
+        mg_itf = max(20, int(eik_iters * 0.80))
+        actual_iters_c = int(max(mg_itc, int(max(Hc, Wc) * iter_floor_c)))
+        actual_iters_f = int(max(mg_itf, int(max(Hf, Wf) * iter_floor_f)))
+
+        cfg_c = _dc_replace(cfg, h=float(ds_coarse), n_iters=actual_iters_c, monotone=True)
+        cfg_f = _dc_replace(cfg, h=float(ds), n_iters=actual_iters_f, monotone=False)
+
+        if disable_checkpoint:
+            ckpt_chunk = max(actual_iters_c, actual_iters_f) + 1
+
+        def _src_mask(B_: int, Hg: int, Wg: int, yx_g: torch.Tensor) -> torch.Tensor:
+            m = torch.zeros((B_, Hg, Wg), dtype=torch.bool, device=device)
+            for i in range(B_):
+                y = int(yx_g[i, 0].item())
+                x = int(yx_g[i, 1].item())
+                m[i, max(0, min(y, Hg - 1)), max(0, min(x, Wg - 1))] = True
+            return m
+
+        if parallel_cases:
+            return self._forward_dm_batch_parallel(
+                batch_nodes_yx, cost_f, cost_c, ds, ds_coarse,
+                Hf, Wf, Hc, Wc, H, W, large_val, ckpt_chunk, gate_alpha,
+                cfg_c, cfg_f, _src_mask, device,
+                use_compile=use_compile,
+            )
+
+        D_list = []
+        for nodes_yx in batch_nodes_yx:
+            N = nodes_yx.shape[0]
+            src_yx = nodes_yx.to(device, torch.long)
+            src_yx[:, 0] = src_yx[:, 0].clamp(0, H - 1)
+            src_yx[:, 1] = src_yx[:, 1].clamp(0, W - 1)
+
+            # coarse solve (detached)
+            cost_c_b = cost_c.expand(N, -1, -1)
+            src_cc = (src_yx // ds_coarse).clamp(min=0)
+            src_cc[:, 0] = src_cc[:, 0].clamp(0, Hc - 1)
+            src_cc[:, 1] = src_cc[:, 1].clamp(0, Wc - 1)
+
+            T_c = _eikonal_soft_sweeping_diff(
+                cost_c_b, _src_mask(N, Hc, Wc, src_cc), cfg_c,
+                checkpoint_chunk=ckpt_chunk, gate_alpha=gate_alpha,
+                use_compile=use_compile,
+            ).detach()
+
+            T_init = F.interpolate(
+                T_c.unsqueeze(1), size=(Hf, Wf), mode="bilinear", align_corners=False,
+            ).squeeze(1).clamp_min(0.0).clamp_max(large_val)
+
+            src_fc = (src_yx // ds).clamp(min=0)
+            src_fc[:, 0] = src_fc[:, 0].clamp(0, Hf - 1)
+            src_fc[:, 1] = src_fc[:, 1].clamp(0, Wf - 1)
+            src_mask_f = _src_mask(N, Hf, Wf, src_fc)
+            T_init = torch.where(src_mask_f, torch.zeros_like(T_init), T_init)
+
+            # fine solve (differentiable — cost_f carries grad)
+            cost_f_b = cost_f.expand(N, -1, -1)
+            T_maps = _eikonal_soft_sweeping_diff_init(
+                cost_f_b, src_mask_f, cfg_f, T_init,
+                checkpoint_chunk=ckpt_chunk, gate_alpha=gate_alpha,
+                use_compile=use_compile,
+            )
+
+            tgt_fc = (src_yx // ds).clamp(min=0)
+            tgt_fc[:, 0] = tgt_fc[:, 0].clamp(0, Hf - 1)
+            tgt_fc[:, 1] = tgt_fc[:, 1].clamp(0, Wf - 1)
+
+            D_eik = torch.stack([T_maps[i, tgt_fc[:, 0], tgt_fc[:, 1]] for i in range(N)])
+            src_f = src_yx.float()
+            D_euc = ((src_f[:, None, :] - src_f[None, :, :]) ** 2).sum(-1).sqrt()
+            D = _mix_eikonal_euclid(D_eik, D_euc, self.eik_gate_logit)
+            D = D - D.diag().diag()
+            D_list.append(D)
+
+        return torch.stack(D_list, dim=0)
+
+    def _forward_dm_batch_parallel(
+        self,
+        batch_nodes_yx, cost_f, cost_c, ds, ds_coarse,
+        Hf, Wf, Hc, Wc, H, W, large_val, ckpt_chunk, gate_alpha,
+        cfg_c, cfg_f, _src_mask, device,
+        use_compile: bool = False,
+    ):
+        """Parallel version: merge all B*N source points into one Eikonal call."""
+        B = len(batch_nodes_yx)
+        Ns = [n.shape[0] for n in batch_nodes_yx]
+        N0 = Ns[0]
+
+        all_src_yx_list = []
+        for nodes_yx in batch_nodes_yx:
+            src_yx = nodes_yx.to(device, torch.long)
+            src_yx[:, 0] = src_yx[:, 0].clamp(0, H - 1)
+            src_yx[:, 1] = src_yx[:, 1].clamp(0, W - 1)
+            all_src_yx_list.append(src_yx)
+        all_src_yx = torch.cat(all_src_yx_list, dim=0)  # [total, 2]
+        total = all_src_yx.shape[0]
+
+        # --- coarse solve (all sources merged, detached) ---
+        cost_c_all = cost_c.expand(total, -1, -1)
+        src_cc = (all_src_yx // ds_coarse).clamp(min=0)
+        src_cc[:, 0] = src_cc[:, 0].clamp(0, Hc - 1)
+        src_cc[:, 1] = src_cc[:, 1].clamp(0, Wc - 1)
+
+        T_c_all = _eikonal_soft_sweeping_diff(
+            cost_c_all, _src_mask(total, Hc, Wc, src_cc), cfg_c,
+            checkpoint_chunk=ckpt_chunk, gate_alpha=gate_alpha,
+            use_compile=use_compile,
+        ).detach()
+
+        # --- warm-start upsample ---
+        T_init_all = F.interpolate(
+            T_c_all.unsqueeze(1), size=(Hf, Wf), mode="bilinear", align_corners=False,
+        ).squeeze(1).clamp_min(0.0).clamp_max(large_val)
+
+        src_fc = (all_src_yx // ds).clamp(min=0)
+        src_fc[:, 0] = src_fc[:, 0].clamp(0, Hf - 1)
+        src_fc[:, 1] = src_fc[:, 1].clamp(0, Wf - 1)
+        src_mask_f = _src_mask(total, Hf, Wf, src_fc)
+        T_init_all = torch.where(src_mask_f, torch.zeros_like(T_init_all), T_init_all)
+
+        # --- fine solve (all sources merged, differentiable) ---
+        cost_f_all = cost_f.expand(total, -1, -1)
+        T_maps_all = _eikonal_soft_sweeping_diff_init(
+            cost_f_all, src_mask_f, cfg_f, T_init_all,
+            checkpoint_chunk=ckpt_chunk, gate_alpha=gate_alpha,
+            use_compile=use_compile,
+        )  # [total, Hf, Wf]
+
+        # --- extract per-case D matrices ---
+        D_list = []
+        offset = 0
+        for b in range(B):
+            N = Ns[b]
+            src_yx_b = all_src_yx_list[b]
+            T_maps_b = T_maps_all[offset:offset + N]  # [N, Hf, Wf]
+
+            tgt_fc = (src_yx_b // ds).clamp(min=0)
+            tgt_fc[:, 0] = tgt_fc[:, 0].clamp(0, Hf - 1)
+            tgt_fc[:, 1] = tgt_fc[:, 1].clamp(0, Wf - 1)
+
+            D_eik = torch.stack([T_maps_b[i, tgt_fc[:, 0], tgt_fc[:, 1]] for i in range(N)])
+            src_f = src_yx_b.float()
+            D_euc = ((src_f[:, None, :] - src_f[None, :, :]) ** 2).sum(-1).sqrt()
+            D = _mix_eikonal_euclid(D_eik, D_euc, self.eik_gate_logit)
+            D = D - D.diag().diag()
+            D_list.append(D)
+            offset += N
+
+        return torch.stack(D_list, dim=0)
+
     # ------------------------------------------------------------------
     # training_step
     # ------------------------------------------------------------------
@@ -2141,7 +2360,9 @@ class SAMRoute(SAMRoad):
                         self.log("delta_sparsity", (delta_dbg.abs() < 1e-3).float().mean(),
                                  on_step=True, on_epoch=False)
                         if self.cost_net_gate_head is not None:
-                            x_dbg = road_prob.unsqueeze(1)
+                            x_dbg = road_prob.float().unsqueeze(1)
+                            if self.route_cost_net_use_grad:
+                                x_dbg = torch.cat([x_dbg, self._sobel_magnitude(x_dbg)], dim=1)
                             if self.route_cost_net_use_coord:
                                 B, _, H, W = x_dbg.shape
                                 yy = torch.linspace(-1, 1, H, device=x_dbg.device, dtype=x_dbg.dtype)

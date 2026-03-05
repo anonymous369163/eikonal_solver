@@ -20,7 +20,7 @@ class TSPModel(nn.Module):
 
     def pre_forward(self, reset_state):
         encoder_mode = self.model_params.get('encoder_mode', 'graph_image_fusion')
-        if encoder_mode == 'graph_image_fusion' and self.model_params.get('use_satellite', False) and reset_state.sat_img is None:
+        if encoder_mode not in ('graph_only', 'e2e_eikonal') and self.model_params.get('use_satellite', False) and reset_state.sat_img is None:
             raise ValueError("use_satellite=True but reset_state.sat_img is None. Enable dataset satellite loading.")
         distance_matrix = getattr(reset_state, 'distance_matrix', None)
         self.encoded_nodes = self.encoder(
@@ -101,9 +101,12 @@ class TSP_Encoder(nn.Module):
         # encoder_mode controls which branch is used:
         #   'graph_image_fusion' (default): graph + xy_img + satellite fusion
         #   'graph_only': only graph encoder + optional distance matrix injection
+        #   'e2e_eikonal': same structure as graph_only, but Trainer uses SAMRoute
+        #                  to compute distance_matrix online (end-to-end differentiable)
         self.encoder_mode = self.model_params.get('encoder_mode', 'graph_image_fusion')
-        if self.encoder_mode not in ('graph_image_fusion', 'graph_only'):
-            raise ValueError(f"Unknown encoder_mode: '{self.encoder_mode}'. Use 'graph_image_fusion' | 'graph_only'.")
+        _valid_modes = ('graph_image_fusion', 'graph_only', 'e2e_eikonal')
+        if self.encoder_mode not in _valid_modes:
+            raise ValueError(f"Unknown encoder_mode: '{self.encoder_mode}'. Use one of {_valid_modes}.")
 
         # ================================================================
         # Scheme 1: inject GT distance matrix into node embeddings (teacher)
@@ -127,7 +130,7 @@ class TSP_Encoder(nn.Module):
             self.distance_use_stats = bool(self.model_params.get('distance_use_stats', True))
             self.distance_alpha = nn.Parameter(torch.tensor(0.1))
 
-        if self.encoder_mode == 'graph_only':
+        if self.encoder_mode in ('graph_only', 'e2e_eikonal'):
             # Only graph encoder: full encoder_layer_num layers, no image branch
             self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])
         else:
@@ -185,7 +188,7 @@ class TSP_Encoder(nn.Module):
             embedded_input = embedded_input + alpha * dist_emb
 
         # ============ encoder_mode branch ============
-        if self.encoder_mode == 'graph_only':
+        if self.encoder_mode in ('graph_only', 'e2e_eikonal'):
             out = embedded_input
             for layer in self.layers:
                 out = layer(out)
@@ -734,7 +737,8 @@ class TSP_Decoder(nn.Module):
         # encoded_nodes.shape: (batch, problem, embedding)
         head_num = self.model_params['head_num']
 
-        if self.model_params.get('encoder_mode', 'graph_image_fusion') == 'graph_only':
+        _enc_mode = self.model_params.get('encoder_mode', 'graph_image_fusion')
+        if _enc_mode in ('graph_only', 'e2e_eikonal'):
             num_img_tokens = 0
         else:
             num_xy_patches = (self.model_params['img_size'] // self.model_params['patch_size']) * (
@@ -778,7 +782,8 @@ class TSP_Decoder(nn.Module):
         q = self.q_first + q_last 
         # shape: (batch, head_num, pomo, qkv_dim)
 
-        if self.model_params.get('encoder_mode', 'graph_image_fusion') == 'graph_only':
+        _enc_mode = self.model_params.get('encoder_mode', 'graph_image_fusion')
+        if _enc_mode in ('graph_only', 'e2e_eikonal'):
             num_img_tokens = 0
         else:
             num_xy_patches = (self.model_params['img_size'] // self.model_params['patch_size']) * (
